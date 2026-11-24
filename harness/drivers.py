@@ -18,6 +18,7 @@ import asyncio
 import json
 import mimetypes
 import re
+import secrets
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -539,6 +540,8 @@ class SessionDriver:
             identity=self._run_context.get("origin_identity") or {},
         )
         child_event._maid_session_id = self.session_id
+        # Ephemeral per-turn binding survives event copies but cannot be supplied by model arguments.
+        child_event._maid_run_token = secrets.token_urlsafe(32)
         # 子执行注册进框架的活跃表，new/reset 触发的停止才能真正传到本轮 runner。
         from astrbot.core.utils.active_event_registry import active_event_registry
 

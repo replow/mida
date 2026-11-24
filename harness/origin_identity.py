@@ -1,9 +1,24 @@
 """Expose the originating message snapshot to the running maid, not as authorization."""
 
 
+import secrets
+
+
 def describe_origin(driver, event):
-    if driver is None or getattr(driver, '_child_event', None) is not event:
-        return {'status': 'unavailable', 'reason': 'not_current_maid_execution'}
+    if driver is None:
+        return {'status': 'unavailable', 'reason': 'maid_session_not_found',
+                'hint': 'Invoke the tool from an active maid task.'}
+    current = getattr(driver, '_child_event', None)
+    if current is None:
+        return {'status': 'unavailable', 'reason': 'maid_execution_not_running'}
+    if current is not event:
+        expected = getattr(current, '_maid_run_token', None)
+        supplied = getattr(event, '_maid_run_token', None)
+        if not (isinstance(expected, str) and isinstance(supplied, str)
+                and expected and secrets.compare_digest(expected, supplied)
+                and getattr(current, '_maid_session_id', None) == getattr(event, '_maid_session_id', None)):
+            return {'status': 'unavailable', 'reason': 'maid_event_mismatch',
+                    'hint': 'The caller event is not bound to this maid execution.'}
     execution = getattr(driver, 'current_execution', None) or {}
     identity = execution.get('origin_identity')
     if not execution.get('task_id') or not isinstance(identity, dict):

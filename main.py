@@ -59,7 +59,7 @@ from .katex_fonts import materialize_katex_fonts
 from .maid_dispatcher import ensure_default_subagent
 from .toolset_adapter import apply_main_tool_policy
 
-__version__ = "2.1.0+identity.3"
+__version__ = "2.1.0+identity.4"
 RELAY_SUMMARY_CHARS = 600
 
 _SETTINGS_SCHEMA_CACHE: dict | None = None
@@ -951,9 +951,33 @@ class MaidAgent(Star):
         Args:
         """
         from .harness.origin_identity import describe_origin
+        from .harness.events_shim import MaidAgentEvent, identity_from_event
+        from astrbot.core.cron.events import CronMessageEvent
 
-        driver = self.registry.driver(str(getattr(event, "_maid_session_id", "") or ""))
-        return self._json_outcome(describe_origin(driver, event))
+        session_id = str(getattr(event, "_maid_session_id", "") or "")
+        if session_id:
+            driver = self.registry.driver(session_id)
+            return self._json_outcome(describe_origin(driver, event))
+        if isinstance(event, (MaidAgentEvent, CronMessageEvent)):
+            return self._json_outcome({"status": "unavailable", "reason": "synthetic_event_without_maid_session"})
+        # If the main agent invokes this tool, report only that direct event;
+        # never label it as a child task or as authorization.
+        try:
+            identity = identity_from_event(event)
+            sender = identity.get("senderId") or ""
+            platform = identity.get("platformName") or ""
+            if not sender:
+                return self._json_outcome({"status": "unavailable", "reason": "direct_sender_missing"})
+            return self._json_outcome({
+                "status": "ok", "scope": "current_direct_message", "is_maid_execution": False,
+                "sender_id": sender, "platform_name": platform,
+                "qq_number": sender if platform.lower() == "aiocqhttp" and sender.isascii() and sender.isdigit() else None,
+                "original_message_id": identity.get("sourceMessageId") or None,
+                "is_astrbot_admin": identity.get("role") == "admin" and identity.get("apiAdminAllowed") is True,
+                "notice": "Main/direct message only; this does not confirm a maid task or authorize remote operations.",
+            })
+        except Exception:
+            return self._json_outcome({"status": "unavailable", "reason": "direct_event_unreadable"})
 
     @filter.llm_tool(name=MAID_READ_TOOL_NAME)
     async def maid_read(self, event, resource: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> str:

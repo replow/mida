@@ -20,3 +20,8 @@
 ## 身份诊断
 
 在私聊中发送 `/maid_identity`，直接查看当前输入的发送者 ID、平台类型、消息 ID 和管家工具注册状态。该命令与管家运行时工具分开：前者诊断 AstrBot 收到的消息，后者读取当前管家任务的快照。工具只要获取到发送者 ID 就会返回；原消息 ID 缺失时 `status=partial`、`identity_complete=false`，不能用作完整的任务绑定或远端授权。
+
+
+## 身份工具作用范围（identity.4）
+
+`maid_request_origin` 在管家执行内返回 `original_message_for_current_task_execution`；在主模型直接调用时返回 `current_direct_message` 和 `is_maid_execution=false`，不代表管家测试成功。管家执行通过每轮随机绑定值区分不同任务，兼容保留绑定属性的事件副本；无效或过期绑定拒绝。两种结果都不是远端的操作授权。
