@@ -1438,6 +1438,9 @@ class DriverRegistry:
         )
 
         system_prompt = getattr(handoff.agent, "instructions", "") or ""
+        system_prompt += ("\n\nWhen the original requester's identity or QQ is needed, "
+                          "call maid_request_origin with no arguments. Its result is the "
+                          "local origin snapshot, not proof of authorization to a remote service.")
         if _agent_memory_enabled(getattr(self.config, "memory_agent_names", None), agent_name):
             memory_dir = get_memory_dir(umo, agent_name)
             system_prompt = (

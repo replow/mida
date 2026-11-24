@@ -28,6 +28,7 @@ from .constants import (
     MAID_NOTIFICATION_ID_META_KEY,
     MAID_NOTIFICATION_IDS_META_KEY,
     MAID_READ_TOOL_NAME,
+    MAID_ORIGIN_TOOL_NAME,
     MAID_REPORT_TOOL_NAME,
     MAID_SEND_MESSAGE_TOOL_NAME,
     MAID_TASK_OUTPUT_TOOL_NAME,
@@ -58,7 +59,7 @@ from .katex_fonts import materialize_katex_fonts
 from .maid_dispatcher import ensure_default_subagent
 from .toolset_adapter import apply_main_tool_policy
 
-__version__ = "2.1.0"
+__version__ = "2.1.0+identity.2"
 RELAY_SUMMARY_CHARS = 600
 
 _SETTINGS_SCHEMA_CACHE: dict | None = None
@@ -406,6 +407,7 @@ class MaidAgent(Star):
             MAID_DELIVER_FILE_TOOL_NAME,
             MAID_REPORT_TOOL_NAME,
             MAID_READ_TOOL_NAME,
+            MAID_ORIGIN_TOOL_NAME,
         ):
             if manager is not None and manager.get_func(tool_name) is None:
                 logger.warning("[maid] 工具 %s 未注册，模型将看到空参数 schema。", tool_name)
@@ -486,6 +488,9 @@ class MaidAgent(Star):
                 },
                 "required": ["state", "summary"],
             }
+        origin_tool = manager.get_func(MAID_ORIGIN_TOOL_NAME) if manager else None
+        if origin_tool is not None:
+            origin_tool.parameters = {"type": "object", "properties": {}, "additionalProperties": False}
         read_tool = manager.get_func(MAID_READ_TOOL_NAME) if manager else None
         if read_tool is not None:
             read_tool.parameters = {
@@ -903,6 +908,20 @@ class MaidAgent(Star):
         except ValueError as exc:
             return self._json_outcome({"status": "error", "error": str(exc)})
         return self._json_outcome(outcome)
+
+    @filter.llm_tool(name=MAID_ORIGIN_TOOL_NAME)
+    async def maid_request_origin(self, event) -> str:
+        """Read the original message sender ID and AstrBot admin status for this maid task.
+
+        Takes no arguments. A QQ number is only returned for a OneBot QQ sender.
+        The result is a local identity snapshot, not remote operation authorization.
+
+        Args:
+        """
+        from .harness.origin_identity import describe_origin
+
+        driver = self.registry.driver(str(getattr(event, "_maid_session_id", "") or ""))
+        return self._json_outcome(describe_origin(driver, event))
 
     @filter.llm_tool(name=MAID_READ_TOOL_NAME)
     async def maid_read(self, event, resource: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> str:
