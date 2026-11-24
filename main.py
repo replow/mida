@@ -59,7 +59,7 @@ from .katex_fonts import materialize_katex_fonts
 from .maid_dispatcher import ensure_default_subagent
 from .toolset_adapter import apply_main_tool_policy
 
-__version__ = "2.1.0+identity.2"
+__version__ = "2.1.0+identity.3"
 RELAY_SUMMARY_CHARS = 600
 
 _SETTINGS_SCHEMA_CACHE: dict | None = None
@@ -908,6 +908,38 @@ class MaidAgent(Star):
         except ValueError as exc:
             return self._json_outcome({"status": "error", "error": str(exc)})
         return self._json_outcome(outcome)
+
+    @filter.command("maid_identity")
+    async def maid_identity_diagnostic(self, event):
+        """Show the input adapter identity and maid tool availability in private chat."""
+        try:
+            private = event.is_private_chat()
+        except Exception:
+            private = False
+        if not private:
+            yield event.plain_result("请在私聊中发送 /maid_identity，避免在群里显示用户 ID。")
+            return
+        from .harness.events_shim import identity_from_event
+
+        try:
+            identity = identity_from_event(event)
+            manager = self.context.get_llm_tool_manager()
+            tool = manager.get_func(MAID_ORIGIN_TOOL_NAME) if manager else None
+            active = tool is not None and getattr(tool, "active", True)
+            sender = identity.get("senderId") or "未获取"
+            platform = identity.get("platformName") or "未获取"
+            message = identity.get("sourceMessageId") or "未获取"
+            text = (f"代理女仆版本：{__version__}\n"
+                    f"当前消息发送者 ID：{sender}\n平台类型：{platform}\n"
+                    f"平台实例：{identity.get('platformId') or '未获取'}\n"
+                    f"消息 ID：{message}\n"
+                    f"AstrBot 管理员：{'是' if identity.get('role') == 'admin' else '否或无法确认'}\n"
+                    f"管家身份工具：{'已注册并启用' if active else '未注册或未启用'}\n"
+                    "此指令读取当前私聊消息；管家需要另开任务调用 maid_request_origin。")
+        except Exception as exc:
+            logger.warning("[maid] 身份诊断失败: %s", type(exc).__name__)
+            text = "读取身份失败，请查看 AstrBot 日志中的身份诊断错误。"
+        yield event.plain_result(text)
 
     @filter.llm_tool(name=MAID_ORIGIN_TOOL_NAME)
     async def maid_request_origin(self, event) -> str:

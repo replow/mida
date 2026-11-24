@@ -15,3 +15,8 @@
 ## 查询本次任务发起人
 
 管家内置工具 `maid_request_origin` 无参数，直接读取本次执行对应的原始消息身份快照，返回发送者 ID、原消息 ID、平台和管理员状态。OneBot QQ（aiocqhttp）且发送者 ID 为数字时，`qq_number` 字段为 QQ 号；其他平台的 sender_id 可能是 openid，`qq_number` 为 null。旧任务或无原消息 ID 的请求会返回 unavailable，请发送新消息新建任务。结果只描述原始派发消息，追加消息有独立 ID。该工具仅供管家使用，不是可供 AgentDock 验签的授权凭证。
+
+
+## 身份诊断
+
+在私聊中发送 `/maid_identity`，直接查看当前输入的发送者 ID、平台类型、消息 ID 和管家工具注册状态。该命令与管家运行时工具分开：前者诊断 AstrBot 收到的消息，后者读取当前管家任务的快照。工具只要获取到发送者 ID 就会返回；原消息 ID 缺失时 `status=partial`、`identity_complete=false`，不能用作完整的任务绑定或远端授权。
