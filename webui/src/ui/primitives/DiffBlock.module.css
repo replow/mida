@@ -1,0 +1,87 @@
+
+.block {
+  --dsl-diff-radius: 12px;
+  --dsl-diff-line-height: 22px;
+
+  position: relative;
+  margin: 16px 0;
+  color: var(--maid-alias-label-primary);
+  background: var(--maid-alias-markdown-code-block);
+  border-radius: var(--dsl-diff-radius);
+}
+
+.copyButton {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 1;
+  background-color: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: var(--maid-alias-label-secondary);
+  cursor: pointer;
+  font: var(--maid-font-xs-13);
+}
+
+.body {
+  padding: 12px 14px;
+  font: var(--maid-font-markdown-code-block);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.line {
+  min-height: var(--dsl-diff-line-height);
+  white-space: pre;
+}
+
+.path {
+  color: var(--maid-alias-label-primary);
+  font-weight: 600;
+  padding-right: 56px;
+}
+
+.gap {
+  color: var(--maid-alias-label-tertiary);
+}
+
+.del::before {
+  content: '- ';
+  color: var(--maid-alias-state-error-primary);
+}
+
+.del {
+  color: var(--maid-alias-state-error-primary);
+}
+
+.add::before {
+  content: '+ ';
+  color: var(--maid-alias-state-success-primary);
+}
+
+.add {
+  color: var(--maid-alias-state-success-primary);
+}
+
+.expand {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  color: var(--maid-alias-label-tertiary);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.expand:hover {
+  color: var(--maid-alias-label-secondary);
+}
+
+.footer {
+  padding: 0 14px 12px;
+  font: var(--maid-font-markdown-code-block);
+  color: var(--maid-alias-label-tertiary);
+}

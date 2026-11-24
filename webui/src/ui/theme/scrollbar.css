@@ -1,0 +1,38 @@
+
+body {
+  --maid-scrollbar-thumb: var(--maid-alias-scrollbar-bg-l1);
+  --maid-scrollbar-thumb-hover: var(--maid-alias-scrollbar-hover-l1);
+  
+  --maid-scrollbar-width: 8px;
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  
+  body,
+  body * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--maid-scrollbar-thumb) transparent;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: var(--maid-scrollbar-thumb);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--maid-scrollbar-thumb-hover);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}

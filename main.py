@@ -1,0 +1,1103 @@
+"""大小姐管家模式插件：RPC 信封 + seq 事件溯源会话日志 +
+投影 + events.mux/events.host SSE 流。聊天侧集成五个 maid 控制工具、
+命令、通知投递与记忆。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from dataclasses import asdict
+from inspect import isawaitable
+from pathlib import Path
+from urllib.parse import quote
+
+from quart import jsonify, make_response, request
+
+from astrbot.api import logger
+from astrbot.api.event import filter
+from astrbot.api.star import Star, StarTools
+from astrbot.core.utils.history_saver import persist_agent_history
+
+from .config import _safe_int, load_maid_mode_config
+from .constants import (
+    MAID_AGENT_TOOL_NAME,
+    MAID_DELIVER_FILE_TOOL_NAME,
+    MAID_LIST_AGENTS_TOOL_NAME,
+    MAID_NOTIFICATION_ID_META_KEY,
+    MAID_NOTIFICATION_IDS_META_KEY,
+    MAID_READ_TOOL_NAME,
+    MAID_REPORT_TOOL_NAME,
+    MAID_SEND_MESSAGE_TOOL_NAME,
+    MAID_TASK_OUTPUT_TOOL_NAME,
+    MAID_TASK_STOP_TOOL_NAME,
+    MAID_TOOL_NAMES,
+    MAID_WORKER_ONLY_TOOL_NAMES,
+    PLUGIN_DATA_DIR_NAME,
+)
+from .harness import contracts as c
+from .harness._log import dump_raw_llm_output, dump_raw_llm_request
+from .harness.admission import INFERRED_DISPATCH_GUIDE
+from .harness.api import ApiProxy
+from .harness.chat_dispatch import READ_DEFAULT_LIMIT, ChatRuntime
+from .harness.db import Database
+from .harness.drivers import DriverRegistry
+from .harness.hub import StreamHub, sse_frame
+from .harness.rpc import (
+    internal_error,
+    new_rpc_id,
+    parse_client_request,
+    server_request,
+    server_response,
+    server_response_error,
+)
+from .harness.store import SessionStore
+from .harness.tasks import HUMAN_ACTION_MAX_CHARS, MAID_REPORT_STATES
+from .katex_fonts import materialize_katex_fonts
+from .maid_dispatcher import ensure_default_subagent
+from .toolset_adapter import apply_main_tool_policy
+
+__version__ = "2.1.0"
+RELAY_SUMMARY_CHARS = 600
+
+_SETTINGS_SCHEMA_CACHE: dict | None = None
+
+_SELF_WAKE_ONLY = "Self-wake (scheduled) turns only; omit when a person's message started this turn."
+_ADMISSION_FORM_PROPERTIES = {
+    "rule_assessments": {
+        "type": "array",
+        "description": f"{_SELF_WAKE_ONLY} Exactly one judgment for every enabled rule; empty when no rule is enabled.",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "rule_id": {"type": "string"},
+                "matched": {"type": "boolean"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+            },
+            "required": ["rule_id", "matched", "reason"],
+        },
+    },
+    "direction": {
+        "type": "object",
+        "description": f"{_SELF_WAKE_ONLY} Whether the work is settled enough to start.",
+        "additionalProperties": False,
+        "properties": {
+            "implementation_requested": {"type": "boolean"},
+            "target_basis": {"type": "string", "enum": ["specified", "existing-standard", "undetermined"]},
+            "requires_design_decision": {"type": "boolean"},
+            "evidence": {"type": "string", "minLength": 1, "maxLength": 700},
+        },
+        "required": ["implementation_requested", "target_basis", "requires_design_decision", "evidence"],
+    },
+    "intent_evidence": {"type": "string", "maxLength": 700, "description": f"{_SELF_WAKE_ONLY} Source quotes that establish the request."},
+    "scope": {"type": "string", "maxLength": 1500, "description": f"{_SELF_WAKE_ONLY} What exactly the maid may do."},
+}
+
+
+def _load_settings_schema() -> dict:
+    global _SETTINGS_SCHEMA_CACHE
+    if _SETTINGS_SCHEMA_CACHE is None:
+        path = Path(__file__).parent / "_conf_schema.json"
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                _SETTINGS_SCHEMA_CACHE = json.load(fh)
+        except OSError:
+            _SETTINGS_SCHEMA_CACHE = {"type": "object", "properties": {}}
+    return _SETTINGS_SCHEMA_CACHE
+
+
+def _config_dict(config) -> dict:
+    """配置对象转回 AstrBot 插件配置的形状；规则列表要带上 template_list 的模板键。"""
+    value = asdict(config)
+    value["inferred_rules"] = [{"__template_key": "rule", **rule} for rule in value["inferred_rules"]]
+    return value
+
+
+class _ConfigHolder:
+    """ApiProxy 的配置面：读 MaidModeConfig、写 AstrBot 插件配置。"""
+
+    def __init__(self, plugin: "MaidAgent"):
+        self.plugin = plugin
+
+    def get_config(self) -> dict:
+        self.plugin._sync_config_from_store()
+        return _config_dict(self.plugin.maid_mode_config)
+
+    def settings_schema(self) -> dict:
+        self.plugin._refresh_tool_whitelist_schema_options()
+        return {"type": "object", "properties": _load_settings_schema()}
+
+    def save_config(self, patch: dict) -> dict:
+        self.plugin._sync_config_from_store()
+        effective = load_maid_mode_config(self.plugin.config, strict=False)
+        candidate = _config_dict(effective)
+        candidate.update(patch)
+        validated = load_maid_mode_config(candidate)
+        self.plugin.config.clear()
+        self.plugin.config.update(candidate)
+        try:
+            self.plugin.config.save_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[maid] 配置持久化失败: %s", exc)
+        self.plugin.maid_mode_config = validated
+        self.plugin.registry.config = self.plugin.maid_mode_config
+        self.plugin._refresh_tool_whitelist_schema_options()
+        return self.get_config()
+
+    def version(self) -> str:
+        return __version__
+
+
+class MaidAgent(Star):
+    """大小姐管家模式插件。"""
+
+    def __init__(self, context, config: dict | None = None):
+        super().__init__(context)
+        self.config = config if config is not None else {}
+        self.maid_mode_config = load_maid_mode_config(self.config, strict=False)
+        self._active_asyncio_tasks: set[asyncio.Task] = set()
+
+        data_root = Path(StarTools.get_data_dir(PLUGIN_DATA_DIR_NAME))
+        self.db = Database(data_root / "maid.sqlite")
+        self.store = SessionStore(data_root, self.db)
+        self.mux_hub = StreamHub("mux")
+        self.host_hub = StreamHub("host")
+        self.registry = DriverRegistry(
+            self.context, self.store, self.mux_hub, self.host_hub, self.maid_mode_config
+        )
+        self.registry.on_wake = self._wake_main_agent
+        self.chat_runtime = ChatRuntime(self)
+        self.api = ApiProxy(store=self.store, registry=self.registry, config_holder=_ConfigHolder(self))
+
+
+    async def initialize(self) -> None:
+        self._patch_llm_tool_schemas()
+        self._refresh_tool_whitelist_schema_options()
+        self._schedule_delayed_tool_options_refresh()
+        self._register_web_apis()
+        self._materialize_katex_fonts()
+        await ensure_default_subagent(self.context, self.maid_mode_config)
+        self.registry.recover_open_tasks()
+        self.registry.effects.start()
+        self._schedule_retention_cleanup()
+        logger.info(
+            "[MaidAgent] 已加载 (%s) | default_agent=%s | max_workers=%d | retention=%dd",
+            __version__,
+            self.maid_mode_config.default_agent_name,
+            self.maid_mode_config.max_workers,
+            self.maid_mode_config.retention_days,
+        )
+
+    async def terminate(self) -> None:
+        await self.registry.shutdown()
+        tasks = [task for task in self._active_asyncio_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_asyncio_tasks.clear()
+        await self.mux_hub.close()
+        await self.host_hub.close()
+        self.db.close()
+
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        self._active_asyncio_tasks.add(task)
+        task.add_done_callback(self._active_asyncio_tasks.discard)
+
+    def _materialize_katex_fonts(self) -> None:
+        """从 dashboard dist 物化 KaTeX 字体到插件页 assets/fonts/（失败不阻塞加载）。"""
+        try:
+            from astrbot.core.dashboard_assets import resolve_dashboard_dist
+
+            dist = resolve_dashboard_dist()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[maid] 解析 dashboard dist 失败，KaTeX 字体未物化: %s", exc)
+            return
+        if not dist:
+            logger.warning("[maid] dashboard 静态资源不可用，KaTeX 字体未物化（公式退回系统字体）")
+            return
+        target = Path(__file__).parent / "pages" / "console" / "assets" / "fonts"
+        count = materialize_katex_fonts(Path(dist), target)
+        if count:
+            logger.info("[maid] KaTeX 字体已物化 %d 个（复用 dashboard dist）", count)
+
+    def _schedule_retention_cleanup(self) -> None:
+        async def _loop() -> None:
+            while True:
+                await asyncio.sleep(3600)
+                try:
+                    removed = await self.registry.retention_prune(self.maid_mode_config.retention_days)
+                    if removed:
+                        logger.info("[maid] retention 清理 %d 个会话", len(removed))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[maid] retention 清理失败: %s", exc)
+
+        self._track_background_task(asyncio.create_task(_loop(), name="maid-retention-loop"))
+
+    def _register_web_apis(self) -> None:
+        prefix = f"/{PLUGIN_DATA_DIR_NAME}"
+        routes = [
+            (f"{prefix}/api/upload", self.web_upload, ["POST"], "attachment upload"),
+            (f"{prefix}/api/file", self.web_file, ["GET"], "attachment download"),
+            (f"{prefix}/api/events.mux", self.web_events_mux, ["GET"], "events.mux SSE"),
+            (f"{prefix}/api/events.host", self.web_events_host, ["GET"], "events.host SSE"),
+            (f"{prefix}/api/<path:method>", self.web_rpc, ["POST"], "unary RPC"),
+        ]
+        for route, handler, methods, desc in routes:
+            self.context.register_web_api(route, handler, methods, desc)
+
+    @staticmethod
+    def _referenced_attachment(log, attachment_id: str) -> dict | None:
+        for event in log.read_events():
+            data = event.get("data", {})
+            candidates = []
+            if event.get("type") in {"user/message", "assistant/message"}:
+                candidates.extend(data.get("content") or data.get("message", {}).get("content") or [])
+            elif event.get("type") == "maid/artifact":
+                candidates.append({"attachment": data.get("attachment")})
+            for block in candidates:
+                ref = block.get("attachment") if isinstance(block, dict) else None
+                if isinstance(ref, dict) and ref.get("attachmentId") == attachment_id:
+                    return ref
+        return None
+
+    async def web_upload(self):
+        session_id = str(request.args.get("sessionId") or "")
+        if not self.store.exists(session_id):
+            return jsonify({"error": "会话不存在。"}), 404
+        try:
+            files = await request.files
+            uploaded = files.get("file")
+            if uploaded is None:
+                return jsonify({"error": "缺少 file 字段。"}), 400
+            raw = uploaded.read()
+            max_bytes = self.maid_mode_config.max_upload_mb * 1024 * 1024
+            ref = self.store.save_attachment_bytes(
+                session_id,
+                raw,
+                str(getattr(uploaded, "mimetype", "") or "application/octet-stream"),
+                str(getattr(uploaded, "filename", "") or "attachment"),
+                max_bytes=max_bytes,
+            )
+            return jsonify({"attachment": ref})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[maid] 控制台附件上传失败: %s", exc)
+            return jsonify({"error": "附件上传失败。"}), 500
+
+    async def web_file(self):
+        session_id = str(request.args.get("sessionId") or "")
+        attachment_id = str(request.args.get("attachmentId") or "")
+        if not self.store.exists(session_id):
+            return jsonify({"error": "会话不存在。"}), 404
+        ref = self._referenced_attachment(self.store.log(session_id), attachment_id)
+        if ref is None:
+            return jsonify({"error": "会话未引用该附件。"}), 404
+        try:
+            _, raw = self.store.load_attachment(session_id, attachment_id)
+        except (FileNotFoundError, ValueError):
+            return jsonify({"error": "附件不存在。"}), 404
+        response = await make_response(raw)
+        response.headers["Content-Type"] = str(ref.get("mediaType") or "application/octet-stream")
+        filename = self.store._attachment_name(str(ref.get("name") or "attachment"))
+        response.headers["Content-Disposition"] = (
+            f"attachment; filename*=UTF-8''{quote(filename)}"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    async def web_rpc(self, method: str):
+        try:
+            body_result = request.get_json()
+            body = await body_result if isawaitable(body_result) else body_result
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:  # noqa: BLE001
+            return jsonify(server_response_error("", internal_error("请求体必须是 JSON。")))
+        try:
+            rpc_id, method_name, payload = parse_client_request(body)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify(server_response_error("", internal_error(str(exc))))
+        if method_name != method:
+            return jsonify(
+                server_response_error(rpc_id, internal_error(f"信封 method 与路径不一致: {method_name}"))
+            )
+        try:
+            value = await self.api.dispatch(method_name, payload, rpc_id=rpc_id)
+            return jsonify(server_response(rpc_id, value))
+        except Exception as exc:  # noqa: BLE001
+            from .harness.rpc import RpcError
+
+            if isinstance(exc, RpcError):
+                return jsonify(server_response_error(rpc_id, exc))
+            logger.error("[maid] RPC %s 失败: %s", method_name, exc, exc_info=True)
+            return jsonify(server_response_error(rpc_id, internal_error(str(exc))))
+
+    async def web_events_mux(self):
+        return await self._sse_response(self.mux_hub, self._mux_baselines())
+
+    async def web_events_host(self):
+        return await self._sse_response(self.host_hub, iter(()))
+
+    def _mux_baselines(self):
+        """订阅建立时的基线帧：attached 会话的 subscribed + 队列快照。"""
+        for session_id, driver in list(self.registry.drivers.items()):
+            try:
+                last_seq = self.store.log(session_id).last_seq
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[maid] 基线帧 last_seq 读取失败: session=%s err=%s", session_id[:8], exc)
+                continue
+            yield server_request(
+                new_rpc_id(), "session/subscribed", c.frame_session_subscribed(session_id, last_seq)
+            )
+            if driver.inbox:
+                items = [
+                    {"id": item["id"], "placement": item["placement"], "message": item["message"]}
+                    for item in driver.inbox
+                ]
+                yield server_request(
+                    new_rpc_id(), "session/queue", c.frame_session_queue(session_id, items)
+                )
+
+    async def _sse_response(self, hub: StreamHub, baselines):
+        queue = await hub.subscribe()
+
+        async def stream():
+            try:
+                yield ": connected\n\n"
+                for frame in baselines:
+                    yield sse_frame(frame)
+                while True:
+                    item = await queue.get()
+                    yield sse_frame(item)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await hub.unsubscribe(queue)
+
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+        try:
+            from starlette.responses import StreamingResponse
+        except ImportError:
+            StreamingResponse = None
+        if StreamingResponse is not None:
+            return StreamingResponse(stream(), headers=headers)
+        response = await make_response(stream(), {**headers, "Transfer-Encoding": "chunked"})
+        response.timeout = None  # type: ignore[attr-defined]
+        return response
+
+
+    def _patch_llm_tool_schemas(self) -> None:
+        manager = self.context.get_llm_tool_manager()
+        for tool_name in (
+            MAID_AGENT_TOOL_NAME,
+            MAID_SEND_MESSAGE_TOOL_NAME,
+            MAID_TASK_OUTPUT_TOOL_NAME,
+            MAID_TASK_STOP_TOOL_NAME,
+            MAID_DELIVER_FILE_TOOL_NAME,
+            MAID_REPORT_TOOL_NAME,
+            MAID_READ_TOOL_NAME,
+        ):
+            if manager is not None and manager.get_func(tool_name) is None:
+                logger.warning("[maid] 工具 %s 未注册，模型将看到空参数 schema。", tool_name)
+        agent_tool = manager.get_func(MAID_AGENT_TOOL_NAME) if manager else None
+        if agent_tool is not None:
+            agent_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "prompt": {"type": "string", "description": "Request for one task; idle work context is reused automatically."},
+                    "task_id": {"type": "string", "description": "Ended task to resume in its own context; not a session ID."},
+                    "force_new": {"type": "boolean", "description": "Explicitly create an independent branch, including while another task runs."},
+                    "tasks": {
+                        "type": "array", "minItems": 2, "maxItems": 5,
+                        "description": "Explicit batch of independent new tasks; does not require force_new.",
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {"prompt": {"type": "string", "minLength": 1}, **_ADMISSION_FORM_PROPERTIES},
+                            "required": ["prompt"],
+                        },
+                    },
+                    **_ADMISSION_FORM_PROPERTIES,
+                },
+            }
+        send_tool = manager.get_func(MAID_SEND_MESSAGE_TOOL_NAME) if manager else None
+        if send_tool is not None:
+            send_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "task_id": {"type": "string", "description": "Open task to send to; required when several tasks are open."},
+                    "message": {"type": "string", "minLength": 1},
+                    **_ADMISSION_FORM_PROPERTIES,
+                },
+                "required": ["message"],
+            }
+        output_tool = manager.get_func(MAID_TASK_OUTPUT_TOOL_NAME) if manager else None
+        if output_tool is not None:
+            output_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            }
+        stop_tool = manager.get_func(MAID_TASK_STOP_TOOL_NAME) if manager else None
+        if stop_tool is not None:
+            stop_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            }
+        deliver_file_tool = manager.get_func(MAID_DELIVER_FILE_TOOL_NAME) if manager else None
+        if deliver_file_tool is not None:
+            deliver_file_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "name": {"type": "string"},
+                    "remark": {"type": "string"},
+                },
+                "required": ["path"],
+            }
+        report_tool = manager.get_func(MAID_REPORT_TOOL_NAME) if manager else None
+        if report_tool is not None:
+            report_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "state": {"type": "string", "enum": list(MAID_REPORT_STATES)},
+                    "summary": {"type": "string", "minLength": 1},
+                    "human_action": {
+                        "type": "string",
+                        "maxLength": HUMAN_ACTION_MAX_CHARS,
+                        "description": "One concrete question for a person, also with state=progress; omit to keep the pending one, an empty string to clear it.",
+                    },
+                },
+                "required": ["state", "summary"],
+            }
+        read_tool = manager.get_func(MAID_READ_TOOL_NAME) if manager else None
+        if read_tool is not None:
+            read_tool.parameters = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "resource": {"type": "string", "description": "conversation, input/<id> or trigger/<id>."},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 8000},
+                },
+                "required": ["resource"],
+            }
+
+    def _sync_config_from_store(self) -> None:
+        """从 self.config 同步最新配置到 maid_mode_config（兼容用户在 AstrBot 原生插件配置弹窗直接保存）。"""
+        if not isinstance(self.config, dict) or not self.config:
+            return
+        try:
+            latest = load_maid_mode_config(self.config, strict=False)
+            if latest != self.maid_mode_config:
+                self.maid_mode_config = latest
+                self.registry.config = latest
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[maid] 同步配置跳过: %s", exc)
+
+    def _collect_available_tool_names(self) -> list[str]:
+        """枚举当前 AstrBot 已注册的所有工具名（含插件/MCP 工具、内置工具及已选白名单项，排除 5 个 maid 控制工具）。"""
+        names: set[str] = set()
+        for existing in self.maid_mode_config.native_tool_whitelist:
+            if existing and existing.strip():
+                names.add(existing.strip())
+        try:
+            tool_mgr = (
+                self.context.get_llm_tool_manager()
+                if hasattr(self.context, "get_llm_tool_manager")
+                else None
+            )
+            if tool_mgr is not None:
+                for tool in getattr(tool_mgr, "func_list", None) or ():
+                    tname = str(getattr(tool, "name", "") or "").strip()
+                    if tname and tname not in MAID_TOOL_NAMES and tname not in MAID_WORKER_ONLY_TOOL_NAMES:
+                        names.add(tname)
+                iter_builtin = getattr(tool_mgr, "iter_builtin_tools", None)
+                if callable(iter_builtin):
+                    for tool in iter_builtin() or ():
+                        tname = str(getattr(tool, "name", "") or "").strip()
+                        if tname and tname not in MAID_TOOL_NAMES:
+                            names.add(tname)
+                else:
+                    for tool in (getattr(tool_mgr, "builtin_func_list", None) or {}).values():
+                        tname = str(getattr(tool, "name", "") or "").strip()
+                        if tname and tname not in MAID_TOOL_NAMES:
+                            names.add(tname)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[maid] 收集可用工具名失败: %s", exc)
+        return sorted(names)
+
+    def _refresh_tool_whitelist_schema_options(self) -> list[str]:
+        """将当前可用工具名列表实时写入本地 schema 缓存与 AstrBot 插件配置 schema.options。"""
+        options = self._collect_available_tool_names()
+        schema_cache = _load_settings_schema()
+        if isinstance(schema_cache, dict) and isinstance(
+            schema_cache.get("native_tool_whitelist"), dict
+        ):
+            schema_cache["native_tool_whitelist"]["options"] = options
+
+        cfg_schema = getattr(self.config, "schema", None)
+        if isinstance(cfg_schema, dict) and isinstance(
+            cfg_schema.get("native_tool_whitelist"), dict
+        ):
+            cfg_schema["native_tool_whitelist"]["options"] = options
+        return options
+
+    def _schedule_delayed_tool_options_refresh(self) -> None:
+        """延迟刷新一次工具下拉选项，确保排在本插件之后初始化的插件工具也被收录进配置面板。"""
+
+        async def _delayed() -> None:
+            for delay in (2.0, 8.0):
+                await asyncio.sleep(delay)
+                try:
+                    self._refresh_tool_whitelist_schema_options()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        self._track_background_task(
+            asyncio.create_task(_delayed(), name="maid-refresh-tool-options")
+        )
+
+    @filter.on_llm_request()
+    async def _on_main_llm_request(self, _event, req) -> None:
+        """主模型（大小姐）请求的 maid 模式处理：工具可见性策略 + 原始请求 dump。
+
+        maid 子代理直接走 ``ToolLoopAgentRunner``（``maid_dispatcher._build_runner``），
+        不经过 ``OnLLMRequestEvent`` 管道钩子，因此这里只影响主模型的请求，不会剥掉
+        maid 自己的工具。dump 放在策略之后，日志里看到的就是过滤后的工具列表。
+        配置实时读取：改配置后下一次请求立即生效，无需重启。
+        """
+        self._sync_config_from_store()
+        self._refresh_tool_whitelist_schema_options()
+        cfg = self.maid_mode_config
+        if req.func_tool is not None:
+            apply_main_tool_policy(
+                req.func_tool,
+                hide_native_tools=cfg.hide_native_tools,
+                hide_transfer_tools=cfg.hide_transfer_tools,
+                native_tool_whitelist=cfg.native_tool_whitelist,
+            )
+        if self._self_wake_dispatch_possible(_event, req):
+            req.system_prompt = f"{req.system_prompt or ''}\n\n{self._inferred_dispatch_guide()}".strip()
+        if cfg.log_raw_llm_io:
+            dump_raw_llm_request(req, source="main")
+
+    def _self_wake_dispatch_possible(self, event, req) -> bool:
+        from astrbot.core.cron.events import CronMessageEvent
+
+        return (
+            isinstance(event, CronMessageEvent)
+            and self.maid_mode_config.inferred_dispatch
+            and req.func_tool is not None
+            and req.func_tool.get_tool(MAID_AGENT_TOOL_NAME) is not None
+        )
+
+    def _inferred_dispatch_guide(self) -> str:
+        """自我唤醒时注入的派发说明，附上启用的规则（对应 superagent prompts/admission.md）。"""
+        rules = [rule for rule in self.maid_mode_config.inferred_rules if rule.enabled]
+        if not rules:
+            return f"{INFERRED_DISPATCH_GUIDE}\n当前没有启用的规则：rule_assessments 传空数组，direction 与证据照填。"
+        lines = "\n".join(f"- {rule.id}（{rule.name}）：{rule.instruction}" for rule in rules)
+        return f"{INFERRED_DISPATCH_GUIDE}\n启用的规则（至少命中一条才派发）：\n{lines}"
+
+    @filter.on_llm_response()
+    async def _log_main_llm_response(self, _event, resp) -> None:
+        """log_raw_llm_io 开启时 dump 主模型最终输出（请求侧见 ``_apply_main_tool_policy``）。"""
+        if self.maid_mode_config.log_raw_llm_io:
+            dump_raw_llm_output(getattr(resp, "completion_text", "") or "", source="main")
+
+    @staticmethod
+    def _json_outcome(payload: dict) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _create_chat_agent(self, umo: str, agent_name: str, *, dispatch_id: str, identity: dict) -> str:
+        sender_id = str(identity.get("senderId") or "chat")
+        log = self.store.create_session(
+            agent_preset=agent_name,
+            meta={
+                "umo": umo,
+                "senderId": sender_id,
+                "agentName": agent_name,
+                "agentId": "",
+                "dispatchId": dispatch_id,
+                "sourceKind": "chat",
+                "identity": identity,
+                "chatOwned": True,
+                "notify": True,
+                "deliveryStatus": "pending",
+            },
+        )
+        log.update_meta(agentId=log.session_id)
+        driver = self.registry.attach(log.session_id)
+        driver.umo, driver.agent_name, driver.sender_id = umo, agent_name, sender_id
+        self.registry.publish_host_frame(
+            c.frame_host_session_added(
+                log.session_id, True, agentPreset=agent_name,
+                sourceKind="chat", dispatchId=dispatch_id,
+            )
+        )
+        return log.session_id
+
+    @filter.llm_tool(name=MAID_AGENT_TOOL_NAME)
+    async def maid_agent(
+        self,
+        event,
+        prompt: str = "",
+        task_id: str = "",
+        force_new: bool = False,
+        tasks: list | None = None,
+        rule_assessments: list | None = None,
+        direction: dict | None = None,
+        intent_evidence: str = "",
+        scope: str = "",
+    ) -> str:
+        """Dispatch a task or resume an ended task. Returns immediately.
+
+        The configured maid is selected automatically. With one idle/default
+        work context, a new task keeps that context. Open tasks take new input
+        through maid_send_message, not this tool. Use force_new for independent
+        parallel work, or tasks for an explicit independent batch. Ambiguous
+        branches require task_id once to choose a default. On a self-wake turn,
+        fill the assessment form fields. After dispatch, reply to the user; do
+        not poll to keep the turn open.
+        """
+        form = _admission_form(rule_assessments, direction, intent_evidence, scope)
+        result = await self.chat_runtime.dispatch(event, prompt=prompt, task_id=task_id, force_new=force_new, tasks=tasks, form=form)
+        return self._json_outcome(result)
+
+    async def _wake_main_agent(self, payload: dict, key: str) -> None:
+        """wake 副作用的处理器：唤醒大小姐转述一次管家的上报；同一次唤醒只投递一次。"""
+        if self.db.execute("SELECT 1 FROM receipts WHERE id = ?", (key,)).fetchone() is not None:
+            return
+        task = self.registry.tasks.get(payload["task_id"])
+        report = next(
+            (item["report"] for item in task["assignments"] if (item.get("report") or {}).get("id") == payload["report_id"]),
+            None,
+        )
+        if report is None or not self.registry.epoch_active(task["umo"], task["epoch"]):
+            return
+        driver = self.registry.driver(task["sessionId"])
+        try:
+            if driver is not None:
+                await driver.emit_delivery("main-summary", "sending")
+            delivered = await self._relay_report(task, report, payload["kind"], key)
+            if driver is not None:
+                await driver.emit_delivery("main-summary", "sent" if delivered else "skipped")
+        except Exception as exc:
+            if driver is not None:
+                await driver.emit_delivery("main-summary", "failed", str(exc))
+            raise
+
+    def _relay_notice(self, task: dict, report: dict, kind: str) -> str:
+        summary = report["summary"]
+        if len(summary) > RELAY_SUMMARY_CHARS:
+            summary = f"{summary[:RELAY_SUMMARY_CHARS]}…（全文 {len(report['summary'])} 字，用 maid_task_output 读取）"
+        lines = [
+            "[管家任务通知]",
+            f"- task_id={task['taskId']} 类型={'管家在问' if kind == 'question' else '结果'} 状态={report['state']}",
+            f"- 任务：{task['description']}",
+        ]
+        if kind == "question":
+            lines.append(f"- 问题：{report.get('question') or (task.get('attention') or {}).get('question', '')}")
+        lines.append(f"  {summary}")
+        return "\n".join(lines)
+
+    async def _relay_report(self, task: dict, report: dict, kind: str, key: str) -> bool:
+        """唤醒大小姐转述管家的上报；返回是否真的唤醒了。
+
+        这条路径绕开 pipeline 自己起主 agent，所以必须自己拿 UMO 的 session
+        lock：管家随时可能在用户正说话的回合中间上报，不排队就会有两个 runner
+        同时读写同一份 conversation history。
+        """
+        from astrbot.core.agent.tool import ToolSet
+        from astrbot.core.astr_main_agent import MainAgentBuildConfig, build_main_agent
+        from astrbot.core.cron.events import CronMessageEvent
+        from astrbot.core.platform.message_session import MessageSession as _MS
+        from astrbot.core.provider.entities import ProviderRequest
+        from astrbot.core.tools.message_tools import SendMessageToUserTool
+        from astrbot.core.utils.active_event_registry import active_event_registry
+        from astrbot.core.utils.session_lock import session_lock_manager
+
+        from .harness.events_shim import ScopedContext
+
+        umo = task["umo"]
+        cancelled = {"value": False}
+
+        def delivery_allowed() -> bool:
+            return not cancelled["value"] and self.registry.epoch_active(umo, task["epoch"])
+
+        ctx = ScopedContext(self.context, delivery_allowed)
+        session = _MS.from_str(umo)
+        summary = self._relay_notice(task, report, kind)
+        extras = {
+            MAID_NOTIFICATION_IDS_META_KEY: [key],
+            "background_task_results": [
+                {
+                    "task_id": task["taskId"],
+                    "description": task["description"],
+                    "status": report["state"],
+                    "result": report["summary"],
+                }
+            ],
+        }
+        cron_event = CronMessageEvent(
+            context=ctx,
+            session=session,
+            message=summary,
+            extras=extras,
+            message_type=session.message_type,
+        )
+        runner_holder = {}
+
+        def stop_relay():
+            cancelled["value"] = True
+            runner = runner_holder.get("runner")
+            if runner is not None:
+                runner.request_stop()
+
+        active_event_registry.register(cron_event)
+        active_event_registry.register_agent_stop_callback(cron_event, stop_relay)
+        try:
+            async with session_lock_manager.acquire_lock(umo):
+                if not delivery_allowed() or self.db.execute("SELECT 1 FROM receipts WHERE id = ?", (key,)).fetchone():
+                    return False
+                conversation_id = await ctx.conversation_manager.get_curr_conversation_id(umo)
+                if conversation_id != task["conversationId"]:
+                    self._record_receipt(key)
+                    return False
+                conv = await ctx.conversation_manager.get_conversation(umo, conversation_id)
+                if conv is None:
+                    return False
+                req = ProviderRequest()
+                req.conversation = conv
+                req.contexts = json.loads(conv.history or "[]")
+                # 转述要求放正文而非 system_prompt：system_prompt 是人格区，一次性
+                # 任务指令混进去会污染人设；正文只随本轮请求生效，且不会落历史。
+                lead = (
+                    "管家执行任务时有一个问题需要用户回答，下面是它的通知。请用你自己的口吻把问题转达给用户。"
+                    if kind == "question"
+                    else "管家上报了任务状态，下面是它的通知。请用你自己的口吻向用户简短转述报告内容，不要展开复述中间过程。"
+                )
+                req.prompt = (
+                    f"{lead}直接把转述写成正文回复即可，正文会自动送达用户；"
+                    "仅在需要附带媒体文件时才调用 send_message_to_user。\n\n"
+                    f"{summary}"
+                )
+                req.func_tool = ToolSet()
+                send_tool = ctx.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
+                if send_tool is not None:
+                    req.func_tool.add_tool(send_tool)
+                from .toolset_adapter import _load_provider_settings, load_execution_settings
+
+                settings = load_execution_settings(ctx, umo)
+                # 只传长期存在的字段：压缩设置交给宿主按 provider_settings 组装，
+                # 避免依赖较新版本才有的框架内部模块。
+                config = MainAgentBuildConfig(
+                    tool_call_timeout=settings["tool_call_timeout"],
+                    tool_schema_mode=settings["tool_schema_mode"],
+                    streaming_response=False,
+                    provider_settings=_load_provider_settings(ctx, umo),
+                )
+                result_build = await build_main_agent(event=cron_event, plugin_context=ctx, config=config, req=req)
+                if result_build is None:
+                    return False
+                # build_main_agent 会把人格工具集并进来，管家专用工具要再剔除一次。
+                if result_build.provider_request.func_tool is not None:
+                    for name in MAID_WORKER_ONLY_TOOL_NAMES:
+                        result_build.provider_request.func_tool.remove_tool(name)
+                runner = result_build.agent_runner
+                runner_holder["runner"] = runner
+                if cancelled["value"]:
+                    runner.request_stop()
+                    return False
+                while not runner.done():
+                    async for _ in runner.step():
+                        pass
+                llm_resp = runner.get_final_llm_resp()
+                relay = (getattr(llm_resp, "completion_text", "") or "").strip() if llm_resp else ""
+                history_summary = f"{summary}\n\n主 Agent 处理结果：{relay}" if relay else summary
+                if not delivery_allowed():
+                    return False
+                if relay and not getattr(cron_event, "_has_send_oper", False):
+                    # 大小姐经常把转述直接写成正文而不是调 send_message_to_user。
+                    # 这条路径自起 agent、不接 pipeline 的 RespondStage，不自己投递
+                    # 这段话就石沉大海——任务跑完聊天里什么都不会出现。
+                    from astrbot.api.event import MessageChain
+
+                    await ctx.send_message(umo, MessageChain().message(relay))
+                await persist_agent_history(
+                    ctx.conversation_manager,
+                    event=cron_event,
+                    req=result_build.provider_request,
+                    summary_note=history_summary,
+                )
+                persisted = await ctx.conversation_manager.get_conversation(umo, conversation_id)
+                history = json.loads(persisted.history or "[]") if persisted else []
+                if history and isinstance(history[-1], dict):
+                    history[-1][MAID_NOTIFICATION_IDS_META_KEY] = [key]
+                    history[-1][MAID_NOTIFICATION_ID_META_KEY] = key
+                    await ctx.conversation_manager.update_conversation(umo, conversation_id, history=history)
+                self._record_receipt(key)
+            return True
+        finally:
+            active_event_registry.unregister(cron_event)
+
+    def _record_receipt(self, key: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO receipts (id, at) VALUES (?, ?)", (key, c.now_ms()))
+
+    @filter.llm_tool(name=MAID_SEND_MESSAGE_TOOL_NAME)
+    async def maid_send_message(
+        self,
+        event,
+        message: str,
+        task_id: str = "",
+        rule_assessments: list | None = None,
+        direction: dict | None = None,
+        intent_evidence: str = "",
+        scope: str = "",
+    ) -> str:
+        """Send new input to an open task, working or idle. Ended tasks use maid_agent.
+
+        The result confirms acceptance, not immediate model consumption. Input
+        reaches a running maid within its current turn, or starts a new turn
+        when the maid is idle. On a self-wake turn, fill the assessment form.
+        """
+        form = _admission_form(rule_assessments, direction, intent_evidence, scope)
+        return self._json_outcome(await self.chat_runtime.send(event, task_id, message, form))
+
+    @filter.llm_tool(name=MAID_REPORT_TOOL_NAME)
+    async def maid_report(self, event, state: str, summary: str, human_action: str | None = None) -> str:
+        """Report the current task's status. Maid only.
+
+        ready: the work is done (ends the task). blocked: cannot go on without a
+        person. failed: the work failed. dropped: nothing to do, or the request
+        is not this task's work (ends the task). progress: a status update that
+        does not wake the mistress unless human_action asks a person a question.
+        A turn that ends without a report is recorded as waiting.
+        """
+        driver = self.registry.driver(str(getattr(event, "_maid_session_id", "") or ""))
+        if driver is None:
+            return self._json_outcome({"status": "error", "error": "此工具只能由运行中的管家使用。"})
+        if state not in MAID_REPORT_STATES:
+            return self._json_outcome({"status": "error", "error": f"state 必须是 {', '.join(MAID_REPORT_STATES)} 之一。"})
+        try:
+            outcome = self.registry.report(
+                driver, state=state, summary=summary, human_action=human_action or None, clear_question=human_action == ""
+            )
+        except ValueError as exc:
+            return self._json_outcome({"status": "error", "error": str(exc)})
+        return self._json_outcome(outcome)
+
+    @filter.llm_tool(name=MAID_READ_TOOL_NAME)
+    async def maid_read(self, event, resource: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> str:
+        """Read a page of this task's resources. Maid only.
+
+        conversation: the mistress's chat as it is now. input/<id>: the full
+        text of a request that was cut short. trigger/<id>: the full message
+        that triggered it. Continue with next_offset until it is null.
+        """
+        driver = self.registry.driver(str(getattr(event, "_maid_session_id", "") or ""))
+        if driver is None:
+            return self._json_outcome({"status": "error", "error": "此工具只能由运行中的管家使用。"})
+        return self._json_outcome(await self.chat_runtime.read(driver, resource, offset, limit))
+
+    @filter.llm_tool(name=MAID_LIST_AGENTS_TOOL_NAME)
+    async def maid_list_agents(self, event) -> str:
+        """List task descriptions, IDs, states and default context association."""
+        return self._json_outcome(await self.chat_runtime.list(event))
+
+    @staticmethod
+    def _agent_progress(driver) -> dict:
+        """本回合的进度快照，全部从事件日志尾部现读，不额外记账。
+
+        工具名单独看没有信息量——女仆大量时间待在「只发工具调用、不说话」的
+        步里，正文是空的。所以入参、输出和推理正文必须一起给出，否则拿到的
+        只是「它在跑」这件早就知道的事。
+        """
+        tool_name = ""
+        tool_done = False
+        tool_input = ""
+        tool_output = ""
+        settled: dict[str, str] = {}
+        text = ""
+        step = 0
+        for event in reversed(driver.log.read_events()):
+            etype = event.get("type")
+            data = event.get("data", {})
+            if etype == "turn/start":
+                break
+            if not step:
+                step = _safe_int(data.get("step"), 0)
+            if etype == "tool/result":
+                if not tool_name:
+                    settled[_tool_result_call_id(data)] = _tool_result_text(data)
+            elif etype == "tool/call" and not tool_name:
+                tool_name = str(data.get("name") or "")
+                call_id = str(data.get("callId") or "")
+                tool_done = call_id in settled
+                tool_output = settled.get(call_id, "")
+                tool_input = _flatten_tool_args(data.get("arguments"))
+            elif etype == "assistant/message" and not text:
+                text = _assistant_say(data)
+            if tool_name and text:
+                break
+        started = driver.turn_started_at
+        return {
+            "step": step,
+            "elapsed_seconds": int(time.monotonic() - started) if started is not None else 0,
+            "tool": tool_name,
+            "tool_done": tool_done,
+            "tool_input": _ellipsis(tool_input, 400),
+            "tool_output": _ellipsis(tool_output, 400),
+            "text": _ellipsis(text, 400),
+        }
+
+    @filter.llm_tool(name=MAID_TASK_OUTPUT_TOOL_NAME)
+    async def maid_task_output(self, event, task_id: str) -> str:
+        """Read one task's progress and execution results without waiting or polling."""
+        return self._json_outcome(await self.chat_runtime.output(event, task_id))
+
+    @filter.llm_tool(name=MAID_TASK_STOP_TOOL_NAME)
+    async def maid_task_stop(self, event, task_id: str) -> str:
+        """Stop the target task and cancel its pending supplementary requests."""
+        return self._json_outcome(await self.chat_runtime.stop(event, task_id))
+
+    @filter.llm_tool(name=MAID_DELIVER_FILE_TOOL_NAME)
+    async def maid_deliver_file(self, event, path: str, name: str = "", remark: str = "") -> str:
+        """Deliver a generated local file to the active chat or Dashboard session."""
+        session_id = str(getattr(event, "_maid_session_id", "") or "")
+        driver = self.registry.driver(session_id)
+        if driver is None:
+            return self._json_outcome({"status": "error", "error": "此工具只能由运行中的女仆使用。"})
+        try:
+            result = await driver.deliver_file(path, name, remark)
+            status = "delivered" if result["delivery"] == "sent" else "persisted"
+            if result["delivery"] == "failed":
+                status = "delivery-failed"
+            return self._json_outcome({"status": status, **result})
+        except (OSError, ValueError) as exc:
+            return self._json_outcome({"status": "error", "error": str(exc)})
+
+    @filter.command_group("maid")
+    def maid(self):
+        pass
+
+    @maid.command("status")
+    async def maid_status(self, event):
+        active = [
+            d
+            for sid, d in self.registry.drivers.items()
+            if d.running and d.umo == event.unified_msg_origin
+        ]
+        if not active:
+            yield event.plain_result("当前会话没有运行中的管家任务。")
+            return
+        lines = ["当前活跃管家会话："]
+        for driver in active:
+            progress = self._agent_progress(driver)
+            name = driver.agent_name or "maid"
+            head = f"- {name} [{driver.session_id[:8]}] 已跑 {progress['elapsed_seconds']}s"
+            if progress["step"]:
+                head = f"{head} · 第 {progress['step']} 步"
+            lines.append(head)
+            if progress["text"]:
+                lines.append(f"  「{_ellipsis(progress['text'], 160)}」")
+            if progress["tool"]:
+                verb = "刚用完" if progress["tool_done"] else "正在用"
+                tool_line = f"  {verb} {progress['tool']}"
+                if progress["tool_input"]:
+                    tool_line = f"{tool_line}: {_ellipsis(progress['tool_input'], 160)}"
+                lines.append(tool_line)
+            if progress["tool_output"]:
+                lines.append(f"  → {_ellipsis(progress['tool_output'], 160)}")
+        yield event.plain_result("\n".join(lines))
+
+    @maid.command("stop")
+    async def maid_stop(self, event):
+        busy = [d for d in self.registry.drivers.values() if d.busy and d.umo == event.unified_msg_origin]
+        for driver in busy:
+            task_id = driver.active_task_id()
+            if task_id:
+                self.registry.stop_task(self.registry.tasks.get(task_id), strength="explicit")
+            else:
+                driver.request_stop()
+        yield event.plain_result(f"已停止 {len(busy)} 个活跃任务。")
+
+    @filter.on_decorating_result()
+    async def restart_on_conversation_reset(self, event) -> None:
+        """/new、/reset 清空主对话后作废旧代次。"""
+        if event.get_extra("_clean_group_context_session"):
+            await self.chat_runtime.restart(event.unified_msg_origin)
+
+
+def _ellipsis(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else f"{flat[: limit - 1]}…"
+
+
+def _tool_result_call_id(data: dict) -> str:
+    blocks = (data.get("message") or {}).get("content") or []
+    first = blocks[0] if blocks and isinstance(blocks[0], dict) else {}
+    return str(first.get("toolCallId") or "")
+
+
+def _tool_result_text(data: dict) -> str:
+    blocks = (data.get("message") or {}).get("content") or []
+    first = blocks[0] if blocks and isinstance(blocks[0], dict) else {}
+    return "".join(
+        part.get("text", "")
+        for part in (first.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "text"
+    ).strip()
+
+
+def _assistant_say(data: dict) -> str:
+    """助手这一步说了什么：正文优先，没有正文就退回推理。"""
+    blocks = (data.get("message") or {}).get("content") or []
+    for wanted in ("text", "reasoning"):
+        said = "".join(
+            block.get("text", "")
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == wanted
+        ).strip()
+        if said:
+            return said
+    return ""
+
+
+def _flatten_tool_args(arguments) -> str:
+    """把工具入参压成一行给人看：单参数直接给值，多参数给 k=v。"""
+    raw = arguments if isinstance(arguments, str) else json.dumps(arguments or {}, ensure_ascii=False)
+    try:
+        # strict=False：模型常把裸换行写进字符串里，严格模式会让整块参数退化成
+        # 一坨 JSON 噪音，而那一坨正是用户想看的代码本身。
+        parsed = json.loads(raw, strict=False)
+    except (TypeError, ValueError):
+        return raw
+    if not isinstance(parsed, dict) or not parsed:
+        return raw
+    if len(parsed) == 1:
+        return str(next(iter(parsed.values())))
+    return " ".join(f"{key}={value}" for key, value in parsed.items())
+
+
+def _admission_form(rule_assessments, direction, intent_evidence, scope) -> dict:
+    """工具参数里的评估表单字段；没填的字段不放进去，交给表单校验报错。"""
+    fields = {"rule_assessments": rule_assessments, "direction": direction, "intent_evidence": intent_evidence, "scope": scope}
+    return {key: value for key, value in fields.items() if value not in (None, "")}

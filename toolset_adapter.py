@@ -1,0 +1,439 @@
+"""
+大小姐管家模式插件 - 1.3.0 Child Toolset Adapter & Memory
+
+职责：
+- 在插件内复现 AstrBot ``FunctionToolExecutor._build_handoff_toolset`` 的工具选择
+  规则，避免继续依赖 Core 私有方法。
+- 从 child 工具集中移除全部 ``maid_*`` 控制面工具和所有 ``transfer_to_*``
+  handoff 工具，禁止递归调度。
+- 对 ``memory_agent_names`` 命中的 agent 自动补齐 AstrBot 原生 Read/Write/Edit
+  文件工具（仍走原始权限检查）。
+- 实时加载 ``MEMORY.md``，最多内联 200 行且不超过 25000 bytes；超限提示拆分
+  topic 文件。不实现 Claude 的 memory snapshot。
+- memory 以 ``UMO + agent_name`` 隔离；不随 30 天 transcript retention 删除。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from astrbot.api import logger
+from astrbot.api.star import StarTools
+from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.tools import computer_tools as ct
+
+if TYPE_CHECKING:
+    from astrbot.api.star import Context
+    from astrbot.core.agent.handoff import HandoffTool
+
+from .config import _safe_float, _safe_int
+from .constants import (
+    MAID_AGENT_TOOL_NAME,
+    MAID_DELIVER_FILE_TOOL_NAME,
+    MAID_TOOL_NAMES,
+    MAID_WORKER_ONLY_TOOL_NAMES,
+    PLUGIN_DATA_DIR_NAME,
+)
+
+MEMORY_SUBDIR = "memory"
+MEMORY_INDEX_FILENAME = "MEMORY.md"
+MEMORY_MAX_LINES = 200
+MEMORY_MAX_BYTES = 25_000
+
+_RECURSION_TOOL_NAMES = MAID_TOOL_NAMES
+_HANDOFF_TOOL_PREFIX = "transfer_to_"
+
+_FILE_TOOL_CLASS_NAMES = ("FileReadTool", "FileWriteTool", "FileEditTool")
+
+_SANDBOX_TOOL_CLASS_NAMES = (
+    "ExecuteShellTool",
+    "PythonTool",
+    "FileUploadTool",
+    "FileDownloadTool",
+    "FileReadTool",
+    "FileWriteTool",
+    "FileEditTool",
+    "GrepTool",
+)
+_LOCAL_TOOL_CLASS_NAMES = (
+    "ExecuteShellTool",
+    "LocalPythonTool",
+    "FileReadTool",
+    "FileWriteTool",
+    "FileEditTool",
+    "GrepTool",
+)
+_CUA_TOOL_CLASS_NAMES = (
+    "CuaScreenshotTool",
+    "CuaMouseClickTool",
+    "CuaKeyboardTypeTool",
+)
+
+
+def _is_handoff_tool(tool: FunctionTool) -> bool:
+    return tool.name.startswith(_HANDOFF_TOOL_PREFIX)
+
+
+def _is_recursion_tool(tool: FunctionTool) -> bool:
+    return tool.name in _RECURSION_TOOL_NAMES
+
+
+def _sanitize_child_toolset(tools: ToolSet | None) -> ToolSet | None:
+    """Strip maid control-plane and handoff tools from a child's toolset.
+
+    Returns None if the result is empty (caller treats None as "no tools").
+    """
+    if tools is None:
+        return None
+    sanitized = ToolSet()
+    for tool in tools.tools:
+        if not getattr(tool, "active", True):
+            continue
+        if _is_recursion_tool(tool) or _is_handoff_tool(tool):
+            continue
+        sanitized.add_tool(tool)
+    return None if sanitized.empty() else sanitized
+
+
+def apply_main_tool_policy(
+    toolset: ToolSet | None,
+    *,
+    hide_native_tools: bool,
+    hide_transfer_tools: bool,
+    native_tool_whitelist: tuple[str, ...] | list[str] | set[str] = (),
+) -> ToolSet | None:
+    """Filter the main (mistress) model's toolset by maid-mode visibility policy.
+
+    - ``hide_native_tools=True``: keep only the five ``maid_*`` tools (plus any
+      tools explicitly listed in ``native_tool_whitelist``) so the main model
+      delegates to the maid instead of calling AstrBot native tools.
+    - Otherwise, when ``hide_transfer_tools=True``: drop all ``transfer_to_*``
+      handoff tools while keeping the maid tools and the rest of the native tools.
+    - Both flags off: keep everything else.
+
+    The maid-only tools (``maid_report`` / ``maid_read``) are always removed.
+
+    Guard: only applies when ``maid_agent`` is present in the toolset, so
+    third-party agent runners that assemble their own tool lists are never
+    stripped. Mutates ``toolset`` in place and returns it for convenience.
+    """
+    if toolset is None:
+        return None
+    if toolset.get_tool(MAID_AGENT_TOOL_NAME) is None:
+        return toolset
+    for name in MAID_WORKER_ONLY_TOOL_NAMES:
+        toolset.remove_tool(name)
+    if hide_native_tools:
+        keep = set(MAID_TOOL_NAMES) | {
+            str(name).strip() for name in (native_tool_whitelist or ()) if str(name).strip()
+        }
+        for tool in list(toolset.tools):
+            if tool.name not in keep:
+                toolset.remove_tool(tool.name)
+    elif hide_transfer_tools:
+        for tool in list(toolset.tools):
+            if _is_handoff_tool(tool) or tool.name == MAID_DELIVER_FILE_TOOL_NAME:
+                toolset.remove_tool(tool.name)
+    return toolset
+
+
+def _get_builtin_file_tools(context: Context) -> dict[str, FunctionTool]:
+    """Resolve the AstrBot builtin file tools (read/write/edit) by class.
+
+    These are the same tools the main agent gets in local computer-use mode, so
+    they already carry the platform's permission/audit machinery.
+    """
+    tool_mgr = context.get_llm_tool_manager()
+    if tool_mgr is None:
+        return {}
+    result: dict[str, FunctionTool] = {}
+    for class_name in _FILE_TOOL_CLASS_NAMES:
+        cls = getattr(ct, class_name, None)
+        if cls is None:
+            continue
+        try:
+            tool = tool_mgr.get_builtin_tool(cls)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[大小姐模式] 获取内置文件工具失败: %s err=%s", class_name, exc
+            )
+            continue
+        if tool is not None and getattr(tool, "active", True):
+            result[tool.name] = tool
+    return result
+
+
+def build_child_toolset(
+    context: Context,
+    *,
+    handoff: HandoffTool,
+    umo: str,
+    agent_name: str,
+    memory_agent_names: list[str] | None,
+) -> ToolSet | None:
+    """Build a sanitized child toolset, reproducing AstrBot's handoff selection.
+
+    Replicates ``FunctionToolExecutor._build_handoff_toolset``:
+    - ``tools=None`` means "all tools except handoffs", including runtime
+      computer-use tools.
+    - A list of names resolves registered + runtime tools.
+    - Empty list means no tools.
+
+    Then strips recursion/handoff tools and optionally augments with file tools
+    for memory-enabled agents.
+    """
+    provider_settings = _load_provider_settings(context, umo)
+    runtime = str(provider_settings.get("computer_use_runtime", "local"))
+    tool_mgr = context.get_llm_tool_manager()
+    runtime_computer_tools = _get_runtime_computer_tools(runtime, tool_mgr, provider_settings)
+
+    raw_tools = getattr(handoff.agent, "tools", None)
+    toolset = ToolSet()
+
+    if raw_tools is None:
+        handoff_names = {
+            t.name for t in (tool_mgr.func_list if tool_mgr else []) if _is_handoff_tool(t)
+        }
+        full = tool_mgr.get_full_tool_set() if tool_mgr else ToolSet()
+        for registered in full.tools:
+            if registered.name in handoff_names:
+                continue
+            if getattr(registered, "active", True):
+                toolset.add_tool(registered)
+        for rt_tool in runtime_computer_tools.values():
+            toolset.add_tool(rt_tool)
+    elif raw_tools:
+        for item in raw_tools:
+            if isinstance(item, FunctionTool):
+                toolset.add_tool(item)
+                continue
+            name = str(item).strip()
+            if not name:
+                continue
+            registered = tool_mgr.get_func(name) if tool_mgr else None
+            if registered and getattr(registered, "active", True):
+                toolset.add_tool(registered)
+                continue
+            rt_tool = runtime_computer_tools.get(name)
+            if rt_tool is not None:
+                toolset.add_tool(rt_tool)
+
+    sanitized = _sanitize_child_toolset(toolset)
+
+    # 上报与按需读取是管家的工作方式本身，不受 subagent 的工具配置限制。
+    for name in MAID_WORKER_ONLY_TOOL_NAMES:
+        worker_tool = tool_mgr.get_func(name) if tool_mgr else None
+        if worker_tool is not None:
+            sanitized = sanitized or ToolSet()
+            sanitized.add_tool(worker_tool)
+
+    if _agent_memory_enabled(memory_agent_names, agent_name):
+        sanitized = _augment_with_file_tools(sanitized, context)
+
+    return sanitized
+
+
+def _augment_with_file_tools(
+    toolset: ToolSet | None,
+    context: Context,
+) -> ToolSet | None:
+    file_tools = _get_builtin_file_tools(context)
+    if not file_tools:
+        return toolset
+    result = toolset if toolset is not None else ToolSet()
+    for tool in file_tools.values():
+        result.add_tool(tool)
+    return None if result.empty() else result
+
+
+def _agent_memory_enabled(
+    memory_agent_names: list[str] | None,
+    agent_name: str,
+) -> bool:
+    if not memory_agent_names:
+        return False
+    target = agent_name.strip().casefold()
+    return any(str(n).strip().casefold() == target for n in memory_agent_names)
+
+
+def _load_provider_settings(context: Context, umo: str) -> dict[str, Any]:
+    cfg = context.get_config(umo=umo)
+    if not isinstance(cfg, dict):
+        return {}
+    settings = cfg.get("provider_settings", {})
+    return settings if isinstance(settings, dict) else {}
+
+
+_COMPRESSION_KEYS: dict[str, tuple[str, ...]] = {
+    "max_turns": ("max_turns", "max_context_length"),
+    "trim_turns": ("trim_turns", "dequeue_context_length"),
+    "overflow_strategy": ("overflow_strategy", "context_limit_reached_strategy"),
+    "instruction": ("instruction", "llm_compress_instruction"),
+    "keep_recent_ratio": ("keep_recent_ratio", "llm_compress_keep_recent_ratio"),
+    "provider_id": ("provider_id", "llm_compress_provider_id"),
+    "fallback_max_tokens": ("fallback_max_tokens", "fallback_max_context_tokens"),
+}
+
+
+def _pick(source: dict[str, Any], key: str, default: Any) -> Any:
+    for name in _COMPRESSION_KEYS[key]:
+        value = source.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def _compression_settings(source: dict[str, Any]) -> dict[str, Any]:
+    """把压缩设置映射为子代理 runner 的构建参数。
+
+    迁移后的 agent_runner.config.compression 与迁移前的 provider_settings 旧键
+    语义相同、键名不同，用同一张别名表读取，避免维护两份映射。
+    """
+    max_turns = _safe_int(_pick(source, "max_turns", -1), -1)
+    trim_turns = _safe_int(_pick(source, "trim_turns", 1), 1)
+    dequeue_turns = min(max(1, trim_turns), max_turns - 1 if max_turns > 0 else trim_turns)
+    return {
+        "context_limit_reached_strategy": str(
+            _pick(source, "overflow_strategy", "") or "truncate_by_turns"
+        ),
+        "llm_compress_instruction": str(_pick(source, "instruction", "") or ""),
+        "llm_compress_keep_recent_ratio": _safe_float(_pick(source, "keep_recent_ratio", 0.15), 0.15),
+        "llm_compress_provider_id": str(_pick(source, "provider_id", "") or ""),
+        "max_context_length": max_turns,
+        "dequeue_context_length": max(1, dequeue_turns),
+        "fallback_max_context_tokens": _safe_int(
+            _pick(source, "fallback_max_tokens", 128000), 128000
+        ),
+    }
+
+
+def load_execution_settings(context: Context, umo: str) -> dict[str, Any]:
+    """子代理执行设置，兼容框架迁移前后的两种配置布局。
+
+    框架把压缩设置从 ``provider_settings`` 迁进 ``agent_runner.config``，迁移会删掉
+    旧键；不同发行版本落在迁移前后，两套都要读。这里不调用框架内部模块，避免绑定
+    单一框架版本。
+    """
+    config = context.get_config(umo=umo)
+    if not isinstance(config, dict):
+        config = {}
+    provider_settings = config.get("provider_settings") or {}
+    runner = (config.get("agent_runner") or {}).get("config") or {}
+    misc = runner.get("misc") or {}
+    compression = runner.get("compression") or {}
+    settings = _compression_settings(compression or provider_settings)
+    settings["streaming_response"] = bool(provider_settings.get("streaming_response", False))
+    settings["tool_call_timeout"] = _safe_int(
+        misc.get("tool_call_timeout", provider_settings.get("tool_call_timeout", 60)), 60
+    )
+    settings["tool_schema_mode"] = str(
+        misc.get("tool_schema_mode") or provider_settings.get("tool_schema_mode") or "full"
+    )
+    return settings
+
+
+def _get_runtime_computer_tools(
+    runtime: str,
+    tool_mgr,
+    provider_settings: dict[str, Any],
+) -> dict[str, FunctionTool]:
+    """Replicate FunctionToolExecutor._get_runtime_computer_tools without
+    calling the private method."""
+    if tool_mgr is None:
+        return {}
+    booter = ""
+    sandbox_cfg = provider_settings.get("sandbox", {})
+    if isinstance(sandbox_cfg, dict):
+        booter = str(sandbox_cfg.get("booter", "") or "").lower()
+
+    def _get(cls) -> FunctionTool | None:
+        try:
+            return tool_mgr.get_builtin_tool(cls)
+        except Exception:  # noqa: BLE001
+            return None
+
+    tools: dict[str, FunctionTool] = {}
+
+    def _add_tools(class_names: tuple[str, ...]) -> None:
+        for class_name in class_names:
+            cls = getattr(ct, class_name, None)
+            if cls is None:
+                continue
+            tool = _get(cls)
+            if tool is not None:
+                tools[tool.name] = tool
+
+    if runtime == "sandbox":
+        _add_tools(_SANDBOX_TOOL_CLASS_NAMES)
+        if booter == "cua":
+            _add_tools(_CUA_TOOL_CLASS_NAMES)
+        return tools
+    if runtime == "local":
+        _add_tools(_LOCAL_TOOL_CLASS_NAMES)
+        return tools
+    return {}
+
+
+_UMO_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_path_segment(value: str) -> str:
+    cleaned = _UMO_SAFE_RE.sub("_", value).strip("._")
+    return cleaned or "default"
+
+
+def get_memory_dir(unified_msg_origin: str, agent_name: str) -> Path:
+    """Return the per-(UMO, agent) memory directory.
+
+    Isolated from the runtime transcript dir and not deleted by retention.
+    """
+    base = StarTools.get_data_dir(PLUGIN_DATA_DIR_NAME) / MEMORY_SUBDIR
+    umo_digest = hashlib.sha256(unified_msg_origin.encode("utf-8")).hexdigest()[:12]
+    umo_safe = f"{_sanitize_path_segment(unified_msg_origin)[:80]}-{umo_digest}"
+    agent_safe = _sanitize_path_segment(agent_name)
+    memory_dir = base / umo_safe / agent_safe
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    return memory_dir
+
+
+def get_memory_index_path(unified_msg_origin: str, agent_name: str) -> Path:
+    return get_memory_dir(unified_msg_origin, agent_name) / MEMORY_INDEX_FILENAME
+
+
+def load_memory_index_inline(unified_msg_origin: str, agent_name: str) -> str | None:
+    """Load MEMORY.md inline, capped at 200 lines / 25000 bytes.
+
+    Returns the inline text, or None if no memory file exists. If the file
+    exceeds the cap, a split hint is appended instead of the overflow.
+    """
+    path = get_memory_index_path(unified_msg_origin, agent_name)
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("[大小姐模式] 读取 MEMORY.md 失败: path=%s err=%s", path, exc)
+        return None
+
+    if len(raw.encode("utf-8")) <= MEMORY_MAX_BYTES:
+        lines = raw.splitlines()
+        if len(lines) <= MEMORY_MAX_LINES:
+            return raw
+
+    truncated_lines: list[str] = []
+    total_bytes = 0
+    for line in raw.splitlines():
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if total_bytes + line_bytes > MEMORY_MAX_BYTES or len(truncated_lines) >= MEMORY_MAX_LINES:
+            break
+        truncated_lines.append(line)
+        total_bytes += line_bytes
+    truncated = "\n".join(truncated_lines)
+    hint = (
+        "\n\n[MEMORY.md 已超过内联上限（200 行 / 25000 bytes），仅显示前面部分。"
+        "请将后续记忆拆分到独立的 topic 文件并在 MEMORY.md 中引用。]"
+    )
+    return truncated + hint

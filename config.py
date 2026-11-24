@@ -1,0 +1,334 @@
+"""大小姐管家模式插件的严格配置契约。"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from math import isfinite
+from string import Formatter
+from typing import Any
+
+from .constants import MISTRESS_REQUEST_BLOCK_LABEL, USER_INPUT_BLOCK_LABEL
+from .harness._log import logger
+
+DEFAULT_ALLOWED_AGENT_NAMES = ("butler",)
+DEFAULT_MAID_AGENT_NAME = "butler"
+DEFAULT_MAX_WORKERS = 3
+MAX_WORKERS_RANGE = (1, 16)
+DEFAULT_RETENTION_DAYS = 30
+DEFAULT_MAX_UPLOAD_MB = 25
+DEFAULT_SESSION_IDLE_TIMEOUT_HOURS = 5.0
+MAID_AGENT_PERSONA = (
+    "你是MuiceMaid，大小姐的管家。你的任务是完成大小姐交给你的请求，"
+    "并使用你拥有的工具达成目的；遇到不确定信息时直接说明，不编造结果。"
+    "完成后用中文向大小姐汇报。"
+)
+DEFAULT_DISPATCH_PROMPT_TEMPLATE = "{user_input_block}{maid_request_block}" + MAID_AGENT_PERSONA
+_DISPATCH_PROMPT_FIELDS = frozenset({"user_input_block", "maid_request_block"})
+_RULE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,80}$")
+
+
+class ConfigValidationError(ValueError):
+    """配置不符合公开契约，errors 使用字段名作为 key。"""
+
+    def __init__(self, errors: dict[str, str]):
+        self.errors = errors
+        super().__init__("; ".join(f"{key}: {message}" for key, message in errors.items()))
+
+
+@dataclass(slots=True, frozen=True)
+class InferredRule:
+    """自我唤醒派发时大小姐要逐条判断的规则。"""
+
+    id: str
+    name: str
+    enabled: bool
+    instruction: str
+
+
+@dataclass(slots=True, frozen=True)
+class MaidModeConfig:
+    allowed_agent_names: tuple[str, ...] = DEFAULT_ALLOWED_AGENT_NAMES
+    default_agent_name: str = DEFAULT_MAID_AGENT_NAME
+    hide_native_tools: bool = True
+    native_tool_whitelist: tuple[str, ...] = ()
+    hide_transfer_tools: bool = True
+    include_raw_user_input: bool = True
+    show_maid_speech: bool = False
+    show_maid_tool_status: bool = False
+    log_raw_llm_io: bool = False
+    dispatch_prompt_template: str = DEFAULT_DISPATCH_PROMPT_TEMPLATE
+    memory_agent_names: tuple[str, ...] = ()
+    max_workers: int = DEFAULT_MAX_WORKERS
+    inferred_dispatch: bool = True
+    inferred_rules: tuple[InferredRule, ...] = ()
+    retention_days: int = DEFAULT_RETENTION_DAYS
+    max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
+    session_idle_timeout_hours: float = DEFAULT_SESSION_IDLE_TIMEOUT_HOURS
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """AstrBot provider settings use loose values; plugin config never uses this helper."""
+    try:
+        if isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    """AstrBot provider settings use loose values; plugin config never uses this helper."""
+    try:
+        if isinstance(value, bool):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _validate_template(template: Any) -> str:
+    if not isinstance(template, str) or not template.strip():
+        raise ConfigValidationError({"dispatch_prompt_template": "必须是非空字符串。"})
+    try:
+        fields = [field for _, field, _, _ in Formatter().parse(template) if field is not None]
+    except ValueError as exc:
+        raise ConfigValidationError({"dispatch_prompt_template": f"模板格式无效: {exc}"}) from exc
+    unknown = sorted(set(fields) - _DISPATCH_PROMPT_FIELDS)
+    if unknown:
+        raise ConfigValidationError(
+            {"dispatch_prompt_template": f"包含未知占位符: {', '.join(unknown)}"}
+        )
+    return template
+
+
+def _strict_names(value: Any, field: str, *, allow_empty: bool) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ConfigValidationError({field: "必须是字符串列表。"})
+    names = tuple(value)
+    if not allow_empty and not names:
+        raise ConfigValidationError({field: "不能为空。"})
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ConfigValidationError({field: "每项必须是非空字符串。"})
+    if len({name.casefold() for name in names}) != len(names):
+        raise ConfigValidationError({field: "不能包含重复名称。"})
+    return tuple(name.strip() for name in names)
+
+
+def _strict_bool(cfg: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = cfg.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigValidationError({key: "必须是布尔值。"})
+    return value
+
+
+def _strict_int(cfg: Mapping[str, Any], key: str, default: int, *, minimum: int) -> int:
+    value = cfg.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigValidationError({key: f"必须是不小于 {minimum} 的整数。"})
+    return value
+
+
+def _max_workers(value: Any) -> int:
+    low, high = MAX_WORKERS_RANGE
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ConfigValidationError({"max_workers": f"必须是 {low} 至 {high} 的整数。"})
+    return value
+
+
+def _inferred_rules(value: Any) -> tuple[InferredRule, ...]:
+    """AstrBot template_list 存成对象数组，每项带 __template_key；这里只取规则字段。"""
+    if not isinstance(value, (list, tuple)):
+        raise ConfigValidationError({"inferred_rules": "必须是规则列表。"})
+    rules = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ConfigValidationError({"inferred_rules": "每条规则必须是对象。"})
+        rule_id = item.get("id")
+        name = item.get("name")
+        enabled = item.get("enabled", True)
+        instruction = item.get("instruction")
+        if not isinstance(rule_id, str) or not _RULE_ID_RE.match(rule_id):
+            raise ConfigValidationError({"inferred_rules": "规则 id 只能由字母、数字、下划线和连字符组成，最长 80 字。"})
+        if not isinstance(name, str) or not name.strip() or not isinstance(instruction, str) or not instruction.strip():
+            raise ConfigValidationError({"inferred_rules": f"规则 {rule_id} 的名称和说明不能为空。"})
+        if not isinstance(enabled, bool):
+            raise ConfigValidationError({"inferred_rules": f"规则 {rule_id} 的 enabled 必须是布尔值。"})
+        rules.append(InferredRule(rule_id, name.strip(), enabled, instruction.strip()))
+    if len({rule.id for rule in rules}) != len(rules):
+        raise ConfigValidationError({"inferred_rules": "规则 id 不能重复。"})
+    return tuple(rules)
+
+
+def _tolerant_with(cfg: Mapping[str, Any], key: str, default: Any, parse) -> Any:
+    try:
+        return parse(cfg.get(key, default))
+    except ConfigValidationError as exc:
+        logger.warning("[maid] 配置项 %s 无效，已改用默认值: %s", key, exc.errors[key])
+        return default
+
+
+def _tolerant_bool(cfg: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = cfg.get(key, default)
+    if isinstance(value, bool):
+        return value
+    logger.warning("[maid] 配置项 %s 不是布尔值，已改用默认值: %r", key, value)
+    return default
+
+
+def _tolerant_int(cfg: Mapping[str, Any], key: str, default: int, *, minimum: int) -> int:
+    value = cfg.get(key, default)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= minimum:
+        return value
+    logger.warning("[maid] 配置项 %s 无效，已改用默认值: %r", key, value)
+    return default
+
+
+def _tolerant_names(cfg: Mapping[str, Any], key: str, default: tuple[str, ...], *, allow_empty: bool) -> tuple[str, ...]:
+    value = cfg.get(key, default)
+    if (
+        isinstance(value, (list, tuple))
+        and (allow_empty or value)
+        and all(isinstance(name, str) and name.strip() for name in value)
+        and len({name.casefold() for name in value}) == len(value)
+    ):
+        return tuple(name.strip() for name in value)
+    logger.warning("[maid] 配置项 %s 无效，已改用默认值: %r", key, value)
+    return default
+
+
+def _tolerant_template(cfg: Mapping[str, Any]) -> str:
+    value = cfg.get("dispatch_prompt_template", DEFAULT_DISPATCH_PROMPT_TEMPLATE)
+    try:
+        return _validate_template(value)
+    except ConfigValidationError as exc:
+        logger.warning(
+            "[maid] 配置项 dispatch_prompt_template 无效，已改用默认模板: %s",
+            exc.errors["dispatch_prompt_template"],
+        )
+        return DEFAULT_DISPATCH_PROMPT_TEMPLATE
+
+
+def _tolerant_idle_timeout(cfg: Mapping[str, Any], default: float) -> float:
+    value = cfg.get("session_idle_timeout_hours", default)
+    try:
+        hours = _idle_timeout(value)
+    except ConfigValidationError:
+        logger.warning("[maid] 配置项 session_idle_timeout_hours 无效，已改用默认值: %r", value)
+        return default
+    return hours
+
+
+def _idle_timeout(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigValidationError({"session_idle_timeout_hours": "必须是正数小时。"})
+    hours = float(value)
+    if not isfinite(hours) or hours <= 0:
+        raise ConfigValidationError({"session_idle_timeout_hours": "必须是有限正数小时。"})
+    return hours
+
+
+def load_maid_mode_config(config: Mapping[str, Any] | None = None, *, strict: bool = True) -> MaidModeConfig:
+    """加载插件配置。
+
+    ``strict=True`` 用于保存路径：无效字段抛 ConfigValidationError，失败不落盘。
+    ``strict=False`` 用于启动加载：旧版本遗留键被忽略，无效存量值回退默认，
+    保证有旧配置时插件仍能启动；不做迁移，也不改变任何派发语义。
+    """
+    cfg = dict(config or {})
+    if not strict:
+        allowed = _tolerant_names(cfg, "allowed_agent_names", DEFAULT_ALLOWED_AGENT_NAMES, allow_empty=False)
+        default_name = str(cfg.get("default_agent_name", DEFAULT_MAID_AGENT_NAME) or "").strip()
+        if not default_name or default_name not in allowed:
+            logger.warning(
+                "[maid] 配置项 default_agent_name 无效，已改用 %s: %r",
+                allowed[0],
+                cfg.get("default_agent_name"),
+            )
+            default_name = allowed[0]
+        memory = _tolerant_names(cfg, "memory_agent_names", (), allow_empty=True)
+        unknown_memory_agents = sorted(set(memory) - set(allowed))
+        if unknown_memory_agents:
+            logger.warning("[maid] memory_agent_names 含未允许的 agent，已忽略: %s", ", ".join(unknown_memory_agents))
+            allowed_casefolded = {name.casefold() for name in allowed}
+            memory = tuple(name for name in memory if name.casefold() in allowed_casefolded)
+        return MaidModeConfig(
+            allowed_agent_names=allowed,
+            default_agent_name=default_name,
+            hide_native_tools=_tolerant_bool(cfg, "hide_native_tools", True),
+            native_tool_whitelist=_tolerant_names(
+                cfg, "native_tool_whitelist", (), allow_empty=True
+            ),
+            hide_transfer_tools=_tolerant_bool(cfg, "hide_transfer_tools", True),
+            include_raw_user_input=_tolerant_bool(cfg, "include_raw_user_input", True),
+            show_maid_speech=_tolerant_bool(cfg, "show_maid_speech", False),
+            show_maid_tool_status=_tolerant_bool(cfg, "show_maid_tool_status", False),
+            log_raw_llm_io=_tolerant_bool(cfg, "log_raw_llm_io", False),
+            dispatch_prompt_template=_tolerant_template(cfg),
+            memory_agent_names=memory,
+            max_workers=_tolerant_with(cfg, "max_workers", DEFAULT_MAX_WORKERS, _max_workers),
+            inferred_dispatch=_tolerant_bool(cfg, "inferred_dispatch", True),
+            inferred_rules=_tolerant_with(cfg, "inferred_rules", (), _inferred_rules),
+            retention_days=_tolerant_int(cfg, "retention_days", DEFAULT_RETENTION_DAYS, minimum=1),
+            max_upload_mb=_tolerant_int(cfg, "max_upload_mb", DEFAULT_MAX_UPLOAD_MB, minimum=1),
+            session_idle_timeout_hours=_tolerant_idle_timeout(cfg, DEFAULT_SESSION_IDLE_TIMEOUT_HOURS),
+        )
+    allowed = _strict_names(cfg.get("allowed_agent_names", DEFAULT_ALLOWED_AGENT_NAMES), "allowed_agent_names", allow_empty=False)
+    default_name = str(cfg.get("default_agent_name", DEFAULT_MAID_AGENT_NAME) or "").strip()
+    if not default_name:
+        raise ConfigValidationError({"default_agent_name": "必须是非空字符串。"})
+    if default_name not in allowed:
+        raise ConfigValidationError(
+            {"default_agent_name": f"必须属于 allowed_agent_names: {', '.join(allowed)}"}
+        )
+    memory = _strict_names(cfg.get("memory_agent_names", ()), "memory_agent_names", allow_empty=True)
+    unknown_memory_agents = sorted(set(memory) - set(allowed))
+    if unknown_memory_agents:
+        raise ConfigValidationError(
+            {"memory_agent_names": f"必须属于 allowed_agent_names: {', '.join(unknown_memory_agents)}"}
+        )
+    return MaidModeConfig(
+        allowed_agent_names=allowed,
+        default_agent_name=default_name,
+        hide_native_tools=_strict_bool(cfg, "hide_native_tools", True),
+        native_tool_whitelist=_strict_names(
+            cfg.get("native_tool_whitelist", ()),
+            "native_tool_whitelist",
+            allow_empty=True,
+        ),
+        hide_transfer_tools=_strict_bool(cfg, "hide_transfer_tools", True),
+        include_raw_user_input=_strict_bool(cfg, "include_raw_user_input", True),
+        show_maid_speech=_strict_bool(cfg, "show_maid_speech", False),
+        show_maid_tool_status=_strict_bool(cfg, "show_maid_tool_status", False),
+        log_raw_llm_io=_strict_bool(cfg, "log_raw_llm_io", False),
+        dispatch_prompt_template=_validate_template(cfg.get("dispatch_prompt_template", DEFAULT_DISPATCH_PROMPT_TEMPLATE)),
+        memory_agent_names=memory,
+        max_workers=_max_workers(cfg.get("max_workers", DEFAULT_MAX_WORKERS)),
+        inferred_dispatch=_strict_bool(cfg, "inferred_dispatch", True),
+        inferred_rules=_inferred_rules(cfg.get("inferred_rules", ())),
+        retention_days=_strict_int(cfg, "retention_days", DEFAULT_RETENTION_DAYS, minimum=1),
+        max_upload_mb=_strict_int(cfg, "max_upload_mb", DEFAULT_MAX_UPLOAD_MB, minimum=1),
+        session_idle_timeout_hours=_idle_timeout(cfg.get("session_idle_timeout_hours", DEFAULT_SESSION_IDLE_TIMEOUT_HOURS)),
+    )
+
+
+def render_dispatch_prompt(
+    template: str,
+    *,
+    true_user_input: str,
+    request_text: str,
+    include_raw_user_input: bool,
+) -> str:
+    """Render an already-validated task prompt; invalid templates are errors, never repaired."""
+    validated = _validate_template(template)
+    request = request_text.strip()
+    if not request:
+        raise ValueError("prompt 不能为空。")
+    user_input_block = ""
+    if include_raw_user_input and true_user_input.strip():
+        user_input_block = f"【{USER_INPUT_BLOCK_LABEL}】\n{true_user_input}\n\n"
+    maid_request_block = f"【{MISTRESS_REQUEST_BLOCK_LABEL}】\n{request}\n\n"
+    return validated.format_map(
+        {"user_input_block": user_input_block, "maid_request_block": maid_request_block}
+    ).strip()

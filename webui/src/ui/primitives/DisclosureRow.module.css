@@ -1,0 +1,75 @@
+
+.root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.row {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  height: 24px;
+  min-width: 0;
+}
+
+.row[data-expandable] {
+  cursor: pointer;
+}
+
+.leading {
+  position: relative;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--maid-alias-label-tertiary);
+}
+
+button.leading {
+  cursor: pointer;
+}
+
+/* DSH 对齐：流行的行内字形以 14px 渲染在 16px 盒内；StateDot 是状态记号不是文本配件，保持原样 */
+.leading svg:not([data-state]) {
+  width: 14px;
+  height: 14px;
+}
+
+.iconIdle {
+  display: inline-flex;
+  opacity: 1;
+  transition: opacity 100ms ease;
+}
+
+.chevronHover {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.row:hover .iconIdle {
+  opacity: 0;
+}
+
+.row:hover .chevronHover {
+  opacity: 1;
+}
+
+.title {
+  flex: none;
+  /* DSH 对齐：流行标题读次级内容档（13px），行高保持 24px */
+  font-size: 13px;
+  line-height: 24px;
+  color: var(--maid-alias-label-secondary);
+}

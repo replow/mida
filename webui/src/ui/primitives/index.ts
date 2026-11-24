@@ -1,0 +1,32 @@
+
+export { StateDot } from './StateDot.tsx'
+export type { StateDotState } from './StateDot.tsx'
+export { DisclosureRow } from './DisclosureRow.tsx'
+export type { DisclosureRowProps } from './DisclosureRow.tsx'
+export { Button } from './Button.tsx'
+export type { ButtonVariant } from './Button.tsx'
+export { Pill } from './Pill.tsx'
+export { Input } from './Input.tsx'
+export { Menu } from './Menu.tsx'
+export type { MenuEntry, MenuItem, MenuSeparator, MenuLabel } from './Menu.tsx'
+export { useAnchoredMaxHeight } from './useAnchoredMaxHeight.ts'
+export { HoverCard } from './HoverCard.tsx'
+export { Modal } from './Modal.tsx'
+export { ConnectionBanner } from './ConnectionBanner.tsx'
+export { Tooltip } from './Tooltip.tsx'
+export type { TooltipSide } from './Tooltip.tsx'
+export { writeClipboard } from './clipboard.ts'
+export { JsonTree } from './JsonTree.tsx'
+export type { JsonTreeProps, JsonTreeLabels } from './JsonTree.tsx'
+export { TerminalBlock, DEFAULT_TERMINAL_MAX_LINES } from './TerminalBlock.tsx'
+export type { TerminalBlockProps, TerminalBlockLabels } from './TerminalBlock.tsx'
+export { DiffBlock, DEFAULT_DIFF_MAX_LINES, diffTotals } from './DiffBlock.tsx'
+export type { DiffBlockProps, DiffHunk } from './DiffBlock.tsx'
+export { SearchBlock, DEFAULT_SEARCH_MAX_LINES } from './SearchBlock.tsx'
+export type {
+  SearchBlockProps, SearchMatchesBlockProps, SearchPathsBlockProps, SearchFileGroup, SearchBlockLineMatch,
+} from './SearchBlock.tsx'
+// markdown 渲染栈（micromark/katex/shiki）与 ReadBlock（shiki）不走 barrel：
+// 产物是单文件，拆不拆 chunk 都一样，但让重型依赖留在 barrel 外可以避免
+// 只用一个 icon 的模块顺带把整个 shiki 拖进依赖图。使用方直接按路径引入。
+export * from './icons/index.tsx'

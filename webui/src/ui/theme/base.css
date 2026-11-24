@@ -1,0 +1,11 @@
+
+:root {
+  /* 单一来源在 fonts.css；这里保留旧变量名供既有组件引用 */
+  --maid-font-family: var(--maid-font-sans);
+  --maid-font-family-code: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas,
+    'Liberation Mono', Menlo, Courier, 'PingFang SC', 'Microsoft YaHei';
+  --maid-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --maid-transition-duration: 0.2s;
+  --maid-transition-duration-fast: 0.1s;
+  --maid-transition-duration-slow: 0.3s;
+}

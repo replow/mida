@@ -1,0 +1,374 @@
+"""session store + 概要索引。
+
+会话日志由 SessionLog 存在数据库里；这里管：
+- 会话发现与概要（updatedAt/blank/parentSession/origin/agentPreset/projections 基线）
+- 附件（prompt 图片的持久化：attachments/<sid>/<attachmentId>.<ext>）
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import mimetypes
+import os
+import re
+import uuid
+from pathlib import Path
+
+from .contracts import now_ms
+from .db import Database
+from .event_log import SessionLog
+from .history import derive_surface, visible_events
+from .projections import ProjectionRegistry
+
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+ATTACHMENT_ID_RE = re.compile(r"^[0-9a-zA-Z_-]{6,64}$")
+
+IMAGE_MEDIA_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+_EXT_MEDIA_TYPE = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ ()\-\[\]]+")
+
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def sniff_image_media_type(raw: bytes, suffix: str = "") -> str | None:
+    """按魔数识别图片类型，识别不出时退回扩展名。"""
+    for magic, media_type in _IMAGE_MAGIC:
+        if raw.startswith(magic):
+            return media_type
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return _EXT_MEDIA_TYPE.get(suffix.lower())
+
+
+def new_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+class SessionStore:
+    def __init__(self, root: Path, db: Database, projections: ProjectionRegistry | None = None):
+        self.root = Path(root)
+        self.db = db
+        self.attachments_dir = self.root / "attachments"
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
+        self.projections = projections or ProjectionRegistry()
+        self._logs: dict[str, SessionLog] = {}
+
+
+    def log(self, session_id: str) -> SessionLog:
+        log = self._logs.get(session_id)
+        if log is None:
+            log = SessionLog(self.db, session_id)
+            self._logs[session_id] = log
+        return log
+
+    def exists(self, session_id: str) -> bool:
+        if not SESSION_ID_RE.match(session_id or ""):
+            return False
+        return self.log(session_id).exists()
+
+    def list_session_ids(self) -> list[str]:
+        return [row[0] for row in self.db.execute("SELECT id FROM sessions ORDER BY id").fetchall()]
+
+
+    def create_session(
+        self,
+        *,
+        session_id: str | None = None,
+        parent_session: str | None = None,
+        origin: str | None = None,
+        delegation_depth: int | None = None,
+        agent_preset: str | None = None,
+        seed_events: list[dict] | None = None,
+        meta: dict | None = None,
+    ) -> SessionLog:
+        sid = session_id or new_session_id()
+        if not SESSION_ID_RE.match(sid):
+            raise ValueError(f"非法 sessionId: {sid}")
+        if self.exists(sid):
+            raise FileExistsError(sid)
+        log = self.log(sid)
+        header: dict = {"createdAt": now_ms()}
+        if parent_session is not None:
+            header["parentSession"] = parent_session
+        if seed_events:
+            header["seedLength"] = len(seed_events)
+        if origin is not None:
+            header["origin"] = origin
+        if delegation_depth is not None:
+            header["delegationDepth"] = delegation_depth
+        if agent_preset is not None:
+            header["agentPreset"] = agent_preset
+        merged_meta = {
+            "createdAt": header["createdAt"],
+            "updatedAt": header["createdAt"],
+            "blank": True,
+        }
+        if meta:
+            merged_meta.update(meta)
+
+        with self.db.transaction():
+            log.create(header)
+            for event in seed_events or []:
+                log.append(
+                    event["type"],
+                    event.get("data", {}),
+                    ignorable=bool(event.get("ignorable")),
+                    surface_op=event.get("surfaceOp", "append"),
+                    source_event_seqs=event.get("sourceEventSeqs"),
+                    time_ms=event.get("time"),
+                )
+            if seed_events:
+                log.append("session/end-seed", {})
+            log.save_meta(merged_meta)
+        return log
+
+
+    def summary(self, session_id: str, *, running: bool = False, with_projections: bool = True) -> dict:
+        log = self.log(session_id)
+        header = log.load_header() or {}
+        meta = log.load_meta()
+        events = log.read_events()
+        surface = derive_surface(events)
+        has_turn = any(e.get("type") == "turn/start" for e in visible_events(events))
+
+        updated_at = int(meta.get("updatedAt") or header.get("createdAt") or 0)
+        last_prompt_at = 0
+        for event in reversed(surface):
+            src = event.get("data", {}).get("source") or {}
+            if event.get("type") == "user/message" and src.get("kind") == "user":
+                last_prompt_at = int(event.get("time", 0))
+                break
+        if last_prompt_at:
+            updated_at = max(updated_at, last_prompt_at)
+
+        item: dict = {
+            "sessionId": session_id,
+            "updatedAt": updated_at,
+            "running": running,
+            "blank": not has_turn,
+        }
+        if meta.get("umo"):
+            item["umo"] = str(meta["umo"] or "")
+        if header.get("parentSession"):
+            item["parentSessionId"] = header["parentSession"]
+        if header.get("origin"):
+            item["origin"] = header["origin"]
+        if header.get("agentPreset"):
+            item["agentPreset"] = header["agentPreset"]
+        for meta_key, summary_key in (
+            ("sourceKind", "sourceKind"),
+            ("dispatchId", "dispatchId"),
+            ("agentId", "agentId"),
+            ("activeTaskId", "taskId"),
+            ("deliveryStatus", "deliveryStatus"),
+        ):
+            if meta.get(meta_key) not in (None, ""):
+                item[summary_key] = meta[meta_key]
+        if with_projections:
+            item["projections"] = self.projections.compute(session_id, events)
+        return item
+
+    def touch(self, session_id: str) -> None:
+        log = self.log(session_id)
+        meta = log.load_meta()
+        meta["updatedAt"] = now_ms()
+        log.save_meta(meta)
+
+
+    @staticmethod
+    def _attachment_name(name: str | None) -> str:
+        """Keep display names harmless; storage never uses them as paths."""
+        candidate = Path(str(name or "attachment")).name.strip().replace("\x00", "")
+        candidate = _SAFE_FILENAME_RE.sub("_", candidate).strip(". ")
+        return candidate[:160] or "attachment"
+
+    @staticmethod
+    def _attachment_extension(media_type: str, name: str | None = None) -> str:
+        known = IMAGE_MEDIA_EXT.get(media_type)
+        if known:
+            return known
+        guessed = mimetypes.guess_extension(media_type, strict=False)
+        if guessed and re.fullmatch(r"\.[A-Za-z0-9]{1,12}", guessed):
+            return guessed
+        suffix = Path(str(name or "")).suffix.lower()
+        return suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,12}", suffix) else ".bin"
+
+    def save_attachment_bytes(
+        self,
+        session_id: str,
+        raw: bytes,
+        media_type: str = "application/octet-stream",
+        name: str | None = None,
+        *,
+        max_bytes: int | None = None,
+    ) -> dict:
+        """Save arbitrary attachment bytes under an opaque id and return its public ref."""
+        if not self.exists(session_id):
+            raise ValueError("会话不存在。")
+        if not raw:
+            raise ValueError("附件内容为空。")
+        if max_bytes is not None and len(raw) > max_bytes:
+            raise ValueError(f"附件超过大小限制（最多 {max_bytes} bytes）。")
+        media_type = str(media_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", media_type):
+            media_type = "application/octet-stream"
+        display_name = self._attachment_name(name)
+        attachment_id = uuid.uuid4().hex
+        target_dir = self.attachments_dir / session_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{attachment_id}{self._attachment_extension(media_type, display_name)}"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, path)
+        ref = {
+            "attachmentId": attachment_id,
+            "mediaType": media_type,
+            "byteLength": len(raw),
+            "name": display_name,
+        }
+        meta_path = target_dir / f".{attachment_id}.json"
+        meta_tmp = meta_path.with_suffix(".tmp")
+        import json
+
+        meta_tmp.write_text(json.dumps(ref, ensure_ascii=False), encoding="utf-8")
+        os.replace(meta_tmp, meta_path)
+        return ref
+
+    def save_attachment(self, session_id: str, media_type: str, data_b64: str, name: str | None = None) -> dict:
+        """持久化 base64 图片，返回 ImageAttachmentRef。"""
+        ext = IMAGE_MEDIA_EXT.get(media_type)
+        if ext is None:
+            raise ValueError(f"不支持的图片类型: {media_type}")
+        try:
+            raw = base64.b64decode(data_b64, validate=False)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("图片 base64 解码失败。") from exc
+        if not raw:
+            raise ValueError("图片内容为空。")
+        return self.save_attachment_bytes(session_id, raw, media_type, name)
+
+    def save_attachment_from_path(self, session_id: str, path: str | Path) -> dict | None:
+        """把本地图片复制进会话附件区，返回 ImageAttachmentRef；无法识别时返回 None。
+
+        派发时用它给女仆留一份副本：主 pipeline 结束后 AstrBot 会清理事件的临时
+        文件，女仆此时往往还在跑，直接引用原路径会读到已删除的文件。
+        """
+        source = Path(path)
+        try:
+            raw = source.read_bytes()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        media_type = sniff_image_media_type(raw, source.suffix)
+        if media_type is None:
+            return None
+        return self.save_attachment(
+            session_id,
+            media_type,
+            base64.b64encode(raw).decode("ascii"),
+            name=source.name,
+        )
+
+    def load_attachment(self, session_id: str, attachment_id: str) -> tuple[dict, bytes]:
+        if not ATTACHMENT_ID_RE.match(attachment_id or ""):
+            raise ValueError("非法附件 id。")
+        target_dir = self.attachments_dir / session_id
+        if not target_dir.is_dir():
+            raise FileNotFoundError(attachment_id)
+        for child in target_dir.iterdir():
+            if not child.is_file() or child.name.startswith("."):
+                continue
+            stem = child.stem
+            if stem != attachment_id:
+                continue
+            media_type = mimetypes.guess_type(child.name)[0] or "application/octet-stream"
+            with open(child, "rb") as fh:
+                raw = fh.read()
+            ref = {
+                "attachmentId": attachment_id,
+                "mediaType": media_type,
+                "byteLength": len(raw),
+            }
+            meta_path = target_dir / f".{attachment_id}.json"
+            try:
+                saved = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    ref.update({key: saved[key] for key in ("name", "mediaType") if key in saved})
+            except (OSError, ValueError):
+                pass
+            return ref, raw
+        raise FileNotFoundError(attachment_id)
+
+    def attachment_path(self, session_id: str, attachment_id: str) -> Path:
+        """Resolve an opaque attachment id without accepting a user-controlled path."""
+        if not ATTACHMENT_ID_RE.match(attachment_id or ""):
+            raise ValueError("非法附件 id。")
+        target_dir = self.attachments_dir / session_id
+        if not target_dir.is_dir():
+            raise FileNotFoundError(attachment_id)
+        for child in target_dir.iterdir():
+            if child.is_file() and not child.name.startswith(".") and child.stem == attachment_id:
+                return child
+        raise FileNotFoundError(attachment_id)
+
+    def attachment_paths_for_prompt(self, session_id: str, refs: list[dict]) -> list[str]:
+        """把 user/message 里的 image 块解析成本地文件路径（供 runner 摄取）。"""
+        paths: list[str] = []
+        for ref in refs:
+            attachment_id = str(ref.get("attachmentId") or "")
+            try:
+                _, raw = self.load_attachment(session_id, attachment_id)
+            except (FileNotFoundError, ValueError):
+                continue
+            ext = IMAGE_MEDIA_EXT.get(str(ref.get("mediaType")), ".png")
+            target_dir = self.attachments_dir / session_id
+            path = target_dir / f"{attachment_id}{ext}"
+            if path.exists():
+                paths.append(str(path))
+        return paths
+
+    def attachment_prompt_text(self, session_id: str, refs: list[dict]) -> str:
+        """Build trusted local-file instructions for non-image agent attachments."""
+        lines: list[str] = []
+        for ref in refs:
+            try:
+                stored, _ = self.load_attachment(session_id, str(ref.get("attachmentId") or ""))
+                path = self.attachment_path(session_id, str(stored["attachmentId"]))
+            except (FileNotFoundError, ValueError):
+                continue
+            lines.append(
+                f"- {stored.get('name') or 'attachment'} ({stored.get('mediaType') or 'application/octet-stream'}): {path}"
+            )
+        return "\n".join(lines)
+
+
+    def delete_session(self, session_id: str) -> None:
+        import shutil
+
+        self.log(session_id).delete()
+        attach_dir = self.attachments_dir / session_id
+        if attach_dir.is_dir():
+            shutil.rmtree(attach_dir, ignore_errors=True)
+        self._logs.pop(session_id, None)
