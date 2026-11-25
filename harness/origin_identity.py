@@ -40,6 +40,7 @@ def describe_origin(driver, event):
         'platform_name': platform,
         'platform_id': identity.get('platformId') or None,
         'sender_id': sender, 'qq_number': qq_number,
+        'simulated_qq': identity.get('simulatedQQ') if platform.lower() == 'webchat' else None,
         'original_message_id': message if has_message else None,
         'is_astrbot_admin': identity.get('role') == 'admin' and identity.get('apiAdminAllowed') is True,
         'identity_complete': has_message,

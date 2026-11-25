@@ -33,11 +33,25 @@ def identity_from_event(event: Any) -> dict:
         api_admin_allowed = False
     sender_id = str(event.get_sender_id() or "")
     message_id = str(getattr(message_obj, "message_id", "") or "")
+    simulation = None
+    if str(getattr(platform_meta, "name", "") or "") == "webchat":
+        try:
+            candidate = event.get_extra("_webchat_qq_simulation_v1")
+            if isinstance(candidate, dict) and candidate.get("simulated") is True and candidate.get("source") == "webchat":
+                qq = candidate.get("qq_number")
+                nickname = candidate.get("nickname")
+                if isinstance(qq, str) and qq.isascii() and qq.isdigit() and 5 <= len(qq) <= 12:
+                    simulation = {"simulated": True, "qq_number": qq,
+                                  "nickname": nickname[:80] if isinstance(nickname, str) else "",
+                                  "source": "webchat", "authenticated_as_qq": False}
+        except Exception:
+            pass
     try:
         is_admin = event.is_admin() is True and api_admin_allowed
     except Exception:
         is_admin = False
     return {
+        "simulatedQQ": simulation,
         "sourceMessageId": message_id,
         "apiAdminAllowed": api_admin_allowed,
         "senderId": str(event.get_sender_id() or ""),

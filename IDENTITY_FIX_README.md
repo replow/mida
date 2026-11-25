@@ -25,3 +25,8 @@
 ## 身份工具作用范围（identity.4）
 
 `maid_request_origin` 在管家执行内返回 `original_message_for_current_task_execution`；在主模型直接调用时返回 `current_direct_message` 和 `is_maid_execution=false`，不代表管家测试成功。管家执行通过每轮随机绑定值区分不同任务，兼容保留绑定属性的事件副本；无效或过期绑定拒绝。两种结果都不是远端的操作授权。
+
+
+## WebChat QQ 模拟
+
+安装并启用 `astrbot_plugin_webchat_qq_simulator` 后，WebChat 发起的新任务的 `maid_request_origin` 额外返回 `simulated_qq`。其中号码仅为插件配置的测试数据；平台与 sender_id 仍为 WebChat，不能用于认证或远端授权。
