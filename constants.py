@@ -12,6 +12,7 @@ MAID_DELIVER_FILE_TOOL_NAME = "maid_deliver_file"
 MAID_REPORT_TOOL_NAME = "maid_report"
 MAID_READ_TOOL_NAME = "maid_read"
 MAID_ORIGIN_TOOL_NAME = "maid_request_origin"
+ADMIN_APPROVAL_TOOL_NAME = "astrbot_admin_approval"
 MAID_TOOL_NAMES = frozenset(
     {
         MAID_AGENT_TOOL_NAME,

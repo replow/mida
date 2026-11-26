@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 from .config import _safe_float, _safe_int
 from .constants import (
+    ADMIN_APPROVAL_TOOL_NAME,
     MAID_AGENT_TOOL_NAME,
     MAID_DELIVER_FILE_TOOL_NAME,
     MAID_TOOL_NAMES,
@@ -108,7 +109,7 @@ def apply_main_tool_policy(
     """Filter the main (mistress) model's toolset by maid-mode visibility policy.
 
     - ``hide_native_tools=True``: keep only the five ``maid_*`` tools (plus any
-      tools explicitly listed in ``native_tool_whitelist``) so the main model
+      authorization tool and tools in ``native_tool_whitelist``) so the main model
       delegates to the maid instead of calling AstrBot native tools.
     - Otherwise, when ``hide_transfer_tools=True``: drop all ``transfer_to_*``
       handoff tools while keeping the maid tools and the rest of the native tools.
@@ -127,7 +128,7 @@ def apply_main_tool_policy(
     for name in MAID_WORKER_ONLY_TOOL_NAMES:
         toolset.remove_tool(name)
     if hide_native_tools:
-        keep = set(MAID_TOOL_NAMES) | {
+        keep = set(MAID_TOOL_NAMES) | {ADMIN_APPROVAL_TOOL_NAME} | {
             str(name).strip() for name in (native_tool_whitelist or ()) if str(name).strip()
         }
         for tool in list(toolset.tools):
@@ -229,6 +230,11 @@ def build_child_toolset(
         if worker_tool is not None:
             sanitized = sanitized or ToolSet()
             sanitized.add_tool(worker_tool)
+
+    approval_tool = tool_mgr.get_func(ADMIN_APPROVAL_TOOL_NAME) if tool_mgr else None
+    if approval_tool is not None and getattr(approval_tool, "active", True):
+        sanitized = sanitized or ToolSet()
+        sanitized.add_tool(approval_tool)
 
     if _agent_memory_enabled(memory_agent_names, agent_name):
         sanitized = _augment_with_file_tools(sanitized, context)

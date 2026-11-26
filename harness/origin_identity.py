@@ -42,6 +42,8 @@ def describe_origin(driver, event):
         'sender_id': sender, 'qq_number': qq_number,
         'simulated_qq': identity.get('simulatedQQ') if platform.lower() == 'webchat' else None,
         'original_message_id': message if has_message else None,
+        'astrbot_role': identity.get('astrbotRole'),
+        'effective_role': identity.get('role'),
         'is_astrbot_admin': identity.get('role') == 'admin' and identity.get('apiAdminAllowed') is True,
         'identity_complete': has_message,
         'notice': 'Local snapshot of the original dispatch, not a signed remote authorization; '

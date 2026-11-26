@@ -15,6 +15,7 @@ from ..config import render_dispatch_prompt
 from ..constants import DISPATCHED_NEXT_STEP
 from ..maid_dispatcher import ensure_default_subagent
 from .admission import FORM_FIELDS, Admission, AdmissionError, assess, parse_form
+from .delegated_changes import parse_changes, render_delegation
 from .events_shim import identity_from_event, image_paths_from_event
 from .tasks import add_input, new_assignment, running_assignment
 
@@ -107,12 +108,16 @@ class ChatRuntime:
     def _dispatch_text(self, item: dict, mandate: dict | None) -> str:
         """派发给管家的第一条消息：截断后的触发消息与请求，推断派发再附上命中的规则。"""
         cfg = self.plugin.maid_mode_config
+        trigger = _truncate(item.get("trigger", ""), TRIGGER_PREVIEW_CHARS, f"trigger/{item['id']}")
+        changes = item["changes"]
         text = render_dispatch_prompt(
             cfg.dispatch_prompt_template,
-            true_user_input=_truncate(item.get("trigger", ""), TRIGGER_PREVIEW_CHARS, f"trigger/{item['id']}"),
+            true_user_input=trigger,
             request_text=_truncate(item["full"], REQUEST_PREVIEW_CHARS, f"input/{item['id']}"),
-            include_raw_user_input=cfg.include_raw_user_input,
+            include_raw_user_input=cfg.include_raw_user_input and not changes,
         )
+        source = render_delegation(item["originIdentity"], changes, original_message=trigger if changes else "")
+        text = f"{text}\n\n{source}"
         if not mandate:
             return text
         # 对应 superagent src/executor/dsh.ts：命中规则的说明优先于默认的答复与沟通方式。
@@ -122,7 +127,10 @@ class ChatRuntime:
         precedence = f"\n命中的规则；它们的做法与沟通要求优先于本任务默认的答复和消息方式：{''.join(lines)}" if lines else ""
         return f"{text}\n\n{scope}{precedence}"
 
-    async def dispatch(self, event, *, prompt: str = "", task_id: str = "", force_new: bool = False, tasks: list | None = None, form: dict | None = None) -> dict:
+    async def dispatch(
+        self, event, *, prompt: str = "", task_id: str = "", force_new: bool = False,
+        tasks: list | None = None, changes: list | None = None, form: dict | None = None,
+    ) -> dict:
         umo = event.unified_msg_origin
         inferred = isinstance(event, CronMessageEvent)
         cfg = self.plugin.maid_mode_config
@@ -134,18 +142,22 @@ class ChatRuntime:
                 return self.error(state, "task_id 和 force_new 不能同时使用。")
             batch = tasks is not None
             if batch:
-                if task_id or force_new or prompt:
-                    return self.error(state, "tasks 不能与单任务 prompt、task_id 或 force_new 混用。")
+                if task_id or force_new or prompt or changes is not None:
+                    return self.error(state, "tasks 不能与单任务 prompt、task_id、force_new 或 changes 混用。")
                 if not isinstance(tasks, list) or not 2 <= len(tasks) <= 5:
                     return self.error(state, "tasks 必须包含 2 至 5 项独立任务。")
-                allowed_keys = {"prompt", *FORM_FIELDS}
+                allowed_keys = {"prompt", "changes", *FORM_FIELDS}
                 if any(not isinstance(item, dict) or not set(item) <= allowed_keys or not isinstance(item.get("prompt"), str) or not item["prompt"].strip() for item in tasks):
-                    return self.error(state, "每项任务需要非空 prompt，只能附带评估表单字段。")
+                    return self.error(state, "每项任务需要非空 prompt，可附带 changes 和评估表单字段。")
                 requests = [(item["prompt"].strip(), item) for item in tasks]
             else:
                 if not isinstance(prompt, str) or not prompt.strip():
                     return self.error(state, "必须提供非空 prompt，或使用 tasks 批量派发。")
-                requests = [(prompt.strip(), form or {})]
+                requests = [(prompt.strip(), {**(form or {}), "changes": changes})]
+            try:
+                changes_by_request = [parse_changes(raw.get("changes")) for _, raw in requests]
+            except ValueError as exc:
+                return self.error(state, str(exc))
 
             admissions: list[tuple[Admission, object] | None] = [None] * len(requests)
             if inferred:
@@ -182,6 +194,7 @@ class ChatRuntime:
             except ValueError as exc:
                 return self.error(state, str(exc))
             identity = identity_from_event(event)
+            identity["requestSource"] = "scheduled" if inferred else "chat"
             if inferred:
                 identity["role"] = "member"
             if target is not None:
@@ -193,13 +206,13 @@ class ChatRuntime:
                 return self.error(state, "主会话已停止或重置，取消本次派发。")
 
             # 以下不再 await：任务、会话绑定、判断记录与 launch 在同一个事务里提交。
-            trigger = str(event.message_str or "")
+            trigger = identity["messageStr"]
             strength = "inferred" if inferred else "explicit"
             if batch or (force_new and working):
                 state["defaultBranch"] = None
             results = []
             with self.registry.db.transaction():
-                for (request, _), admitted in zip(requests, admissions):
+                for (request, _), admitted, delegated_changes in zip(requests, admissions, changes_by_request, strict=True):
                     if admitted is not None and not admitted[0].accepted:
                         admission, parsed = admitted
                         self.decisions.record(
@@ -238,6 +251,7 @@ class ChatRuntime:
                     task["originIdentity"] = identity.copy()
                     item = add_input(task, "", human=not inferred, full=request, trigger=trigger, images=refs)
                     item["originIdentity"] = identity.copy()
+                    item["changes"] = delegated_changes
                     item["text"] = self._dispatch_text(item, mandate)
                     assignment = new_assignment(task, sid)
                     assignment["originIdentity"] = identity.copy()
@@ -265,7 +279,9 @@ class ChatRuntime:
                 outcome["next"] = DISPATCHED_NEXT_STEP
             return outcome
 
-    async def send(self, event, task_id: str, message: str, form: dict | None = None) -> dict:
+    async def send(
+        self, event, task_id: str, message: str, form: dict | None = None, *, changes: list | None = None,
+    ) -> dict:
         inferred = isinstance(event, CronMessageEvent)
         async with self.chats.lock(event.unified_msg_origin):
             state = await self.state(event)
@@ -297,7 +313,12 @@ class ChatRuntime:
                     )
                     return {**self.tasks.card(task), "status": "ignored", "reason": admission.reason}
 
+            try:
+                delegated_changes = parse_changes(changes)
+            except ValueError as exc:
+                return self.error(state, str(exc))
             identity = identity_from_event(event)
+            identity["requestSource"] = "scheduled" if inferred else "chat"
             owner = task.get("originIdentity") or {}
             if inferred or not all((owner.get("senderId"), owner.get("platformId"), identity.get("senderId"), identity.get("platformId"), identity.get("sourceMessageId"))) or owner.get("senderId") != identity.get("senderId") or owner.get("platformId") != identity.get("platformId"):
                 return self.error(state, "任务发起人无法确认或不一致，请由原发起人操作或新建任务。")
@@ -307,9 +328,14 @@ class ChatRuntime:
                 return self.error(state, "当前权限与任务发起时不同，请新建任务。")
             text = message.strip()
             with self.registry.db.transaction():
-                item = add_input(task, "", human=not inferred, full=text)
+                item = add_input(task, "", human=not inferred, full=text, trigger=identity["messageStr"])
                 item["originIdentity"] = identity.copy()
-                item["text"] = "【补充要求】\n" + _truncate(text, INPUT_PREVIEW_CHARS, f"input/{item['id']}")
+                item["changes"] = delegated_changes
+                content = ["【补充要求】", _truncate(text, INPUT_PREVIEW_CHARS, f"input/{item['id']}")]
+                show_trigger = delegated_changes or self.plugin.maid_mode_config.include_raw_user_input
+                trigger = _truncate(identity["messageStr"], TRIGGER_PREVIEW_CHARS, f"trigger/{item['id']}") if show_trigger else ""
+                content.append(render_delegation(identity, delegated_changes, original_message=trigger))
+                item["text"] = "\n".join(content)
                 self.tasks.save(task)
                 # 排队中的执行启动时会一并带上；进行中的执行由 delivery 送达。
                 if running_assignment(task) is not None:

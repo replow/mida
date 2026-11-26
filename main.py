@@ -22,6 +22,7 @@ from astrbot.core.utils.history_saver import persist_agent_history
 
 from .config import _safe_int, load_maid_mode_config
 from .constants import (
+    ADMIN_APPROVAL_TOOL_NAME,
     MAID_AGENT_TOOL_NAME,
     MAID_DELIVER_FILE_TOOL_NAME,
     MAID_LIST_AGENTS_TOOL_NAME,
@@ -43,6 +44,7 @@ from .harness.admission import INFERRED_DISPATCH_GUIDE
 from .harness.api import ApiProxy
 from .harness.chat_dispatch import READ_DEFAULT_LIMIT, ChatRuntime
 from .harness.db import Database
+from .harness.delegated_changes import CHANGES_SCHEMA
 from .harness.drivers import DriverRegistry
 from .harness.hub import StreamHub, sse_frame
 from .harness.rpc import (
@@ -59,7 +61,7 @@ from .katex_fonts import materialize_katex_fonts
 from .maid_dispatcher import ensure_default_subagent
 from .toolset_adapter import apply_main_tool_policy
 
-__version__ = "2.1.0+identity.5"
+__version__ = "2.1.0+identity.6"
 RELAY_SUMMARY_CHARS = 600
 
 _SETTINGS_SCHEMA_CACHE: dict | None = None
@@ -425,10 +427,11 @@ class MaidAgent(Star):
                         "description": "Explicit batch of independent new tasks; does not require force_new.",
                         "items": {
                             "type": "object", "additionalProperties": False,
-                            "properties": {"prompt": {"type": "string", "minLength": 1}, **_ADMISSION_FORM_PROPERTIES},
+                            "properties": {"prompt": {"type": "string", "minLength": 1}, "changes": CHANGES_SCHEMA, **_ADMISSION_FORM_PROPERTIES},
                             "required": ["prompt"],
                         },
                     },
+                    "changes": CHANGES_SCHEMA,
                     **_ADMISSION_FORM_PROPERTIES,
                 },
             }
@@ -440,6 +443,7 @@ class MaidAgent(Star):
                 "properties": {
                     "task_id": {"type": "string", "description": "Open task to send to; required when several tasks are open."},
                     "message": {"type": "string", "minLength": 1},
+                    "changes": CHANGES_SCHEMA,
                     **_ADMISSION_FORM_PROPERTIES,
                 },
                 "required": ["message"],
@@ -598,6 +602,22 @@ class MaidAgent(Star):
                 hide_transfer_tools=cfg.hide_transfer_tools,
                 native_tool_whitelist=cfg.native_tool_whitelist,
             )
+        if req.func_tool is not None:
+            additions = []
+            if req.func_tool.get_tool(MAID_AGENT_TOOL_NAME) is not None:
+                additions.append(
+                    "委派任何修改时，在 maid_agent 或 maid_send_message 的 changes 中逐项填写"
+                    "具体操作、精确目标和 JSON 取值。批量任务在各自的 changes 填写。"
+                    "目标或取值不明确时先向用户核实。只读任务省略 changes。"
+                )
+            if req.func_tool.get_tool(ADMIN_APPROVAL_TOOL_NAME) is not None:
+                additions.append(
+                    "权限不足或操作需要确认时，可用 astrbot_admin_approval 申请管理员确认。"
+                    "只把 approved 视为管理员已确认对应操作。若返回 pending 或 sending，"
+                    "告知用户等待确认和申请编号，结束本轮。之后可以用 status 查询。"
+                )
+            if additions:
+                req.system_prompt = "\n\n".join(part for part in (req.system_prompt, *additions) if part)
         if self._self_wake_dispatch_possible(_event, req):
             req.system_prompt = f"{req.system_prompt or ''}\n\n{self._inferred_dispatch_guide()}".strip()
         if cfg.log_raw_llm_io:
@@ -667,6 +687,7 @@ class MaidAgent(Star):
         task_id: str = "",
         force_new: bool = False,
         tasks: list | None = None,
+        changes: list | None = None,
         rule_assessments: list | None = None,
         direction: dict | None = None,
         intent_evidence: str = "",
@@ -680,10 +701,13 @@ class MaidAgent(Star):
         parallel work, or tasks for an explicit independent batch. Ambiguous
         branches require task_id once to choose a default. On a self-wake turn,
         fill the assessment form fields. After dispatch, reply to the user; do
-        not poll to keep the turn open.
+        not poll to keep the turn open. Include changes for every mutation.
         """
         form = _admission_form(rule_assessments, direction, intent_evidence, scope)
-        result = await self.chat_runtime.dispatch(event, prompt=prompt, task_id=task_id, force_new=force_new, tasks=tasks, form=form)
+        result = await self.chat_runtime.dispatch(
+            event, prompt=prompt, task_id=task_id, force_new=force_new,
+            tasks=tasks, changes=changes, form=form,
+        )
         return self._json_outcome(result)
 
     async def _wake_main_agent(self, payload: dict, key: str) -> None:
@@ -872,6 +896,7 @@ class MaidAgent(Star):
         event,
         message: str,
         task_id: str = "",
+        changes: list | None = None,
         rule_assessments: list | None = None,
         direction: dict | None = None,
         intent_evidence: str = "",
@@ -881,10 +906,11 @@ class MaidAgent(Star):
 
         The result confirms acceptance, not immediate model consumption. Input
         reaches a running maid within its current turn, or starts a new turn
-        when the maid is idle. On a self-wake turn, fill the assessment form.
+        when the maid is idle. Include changes for every added or revised mutation.
+        On a self-wake turn, fill the assessment form.
         """
         form = _admission_form(rule_assessments, direction, intent_evidence, scope)
-        return self._json_outcome(await self.chat_runtime.send(event, task_id, message, form))
+        return self._json_outcome(await self.chat_runtime.send(event, task_id, message, form, changes=changes))
 
     @filter.llm_tool(name=MAID_REPORT_TOOL_NAME)
     async def maid_report(self, event, state: str, summary: str, human_action: str | None = None) -> str:

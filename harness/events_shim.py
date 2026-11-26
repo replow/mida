@@ -54,7 +54,7 @@ def identity_from_event(event: Any) -> dict:
         "simulatedQQ": simulation,
         "sourceMessageId": message_id,
         "apiAdminAllowed": api_admin_allowed,
-        "senderId": str(event.get_sender_id() or ""),
+        "senderId": sender_id,
         "senderName": str(event.get_sender_name() or ""),
         "selfId": str(event.get_self_id() or ""),
         "groupId": str(event.get_group_id() or ""),
@@ -63,8 +63,9 @@ def identity_from_event(event: Any) -> dict:
         "platformId": str(getattr(platform_meta, "id", "") or ""),
         "supportStreamingMessage": bool(getattr(platform_meta, "support_streaming_message", False)),
         "supportProactiveMessage": bool(getattr(platform_meta, "support_proactive_message", False)),
+        "astrbotRole": str(getattr(event, "role", "") or "unknown"),
         "role": "admin" if is_admin and sender_id and message_id else "member",
-        "messageStr": str(getattr(message_obj, "message_str", "") or ""),
+        "messageStr": str(getattr(message_obj, "message_str", "") or event.get_message_str() or ""),
     }
 
 
